@@ -1,0 +1,18 @@
+import "time.o9";
+
+main {
+    string transcript = "";
+    print("STRING_PROBE_START\n");
+    Task<int64> pause = spawn TimeSleepRaw(5000);
+    pause.take();
+    int64 i = 0;
+    while(i < 500) {
+        string next = cat(transcript, "[2026-10-11] <alice> a growing message\n");
+        transcript.dispose();
+        transcript = next;
+        i = i + 1;
+    }
+    print("STRING_PROBE_DONE\n");
+    Task<int64> linger = spawn TimeSleepRaw(30000);
+    linger.take();
+}

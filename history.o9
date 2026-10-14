@@ -1,0 +1,258 @@
+// A bounded zlib snapshot per server and channel. The 9P view stays plain text.
+// This small private index lets the service find every conversation archive
+// after a restart. Transcript payloads remain in the compressed .o9h files.
+function IrcHistoryIndexPathRaw(string directory, string address) string {
+    string out;
+    c {
+        char *dir, path[1024];
+        uchar *p;
+        ulong server;
+        vlong i;
+
+        out = o9_string_from_c("");
+        dir = o9_string_cstr(directory);
+        if(dir != nil && dir[0] != 0){
+            server = 2166136261UL;
+            p = (uchar*)o9_string_data(address);
+            for(i = 0; i < o9_string_len(address); i++)
+                server = (server ^ p[i]) * 16777619UL;
+            snprint(path, sizeof path, "%s/%08lux-index.o9i", dir, server);
+            out = o9_string_from_c(path);
+        }
+        free(dir);
+    }
+    return out;
+}
+
+function IrcHistoryIndexLoadRaw(string path) string {
+    string out;
+    c {
+        char *name;
+        char data[16385];
+        Dir *d;
+        int fd, n;
+
+        out = o9_string_from_c("");
+        name = o9_string_cstr(path);
+        if(name != nil && (d = dirstat(name)) != nil){
+            if(d->length >= 0 && d->length <= 16384){
+                fd = open(name, OREAD);
+                if(fd >= 0){
+                    n = readn(fd, data, d->length);
+                    if(n == d->length)
+                        out = o9_string_new(data, n);
+                    close(fd);
+                }
+            }
+            free(d);
+        }
+        free(name);
+    }
+    return out;
+}
+
+function IrcHistoryIndexSaveRaw(string path, string content) bool {
+    bool out;
+    c {
+        char *name;
+        int fd;
+        vlong n;
+
+        out = 0;
+        name = o9_string_cstr(path);
+        n = o9_string_len(content);
+        if(name != nil && n >= 0 && n <= 16384){
+            fd = create(name, OWRITE|OTRUNC, 0600);
+            if(fd >= 0){
+                out = write(fd, o9_string_data(content), n) == n;
+                close(fd);
+            }
+        }
+        free(name);
+    }
+    return out;
+}
+
+function IrcHistoryPathRaw(string directory, string address, string channel) string {
+    string out;
+    c {
+        char *dir, path[1024];
+        uchar *p;
+        ulong server, room;
+        vlong i;
+
+        out = o9_string_from_c("");
+        dir = o9_string_cstr(directory);
+        if(dir != nil && dir[0] != 0){
+            server = 2166136261UL;
+            p = (uchar*)o9_string_data(address);
+            for(i = 0; i < o9_string_len(address); i++)
+                server = (server ^ p[i]) * 16777619UL;
+            room = 2166136261UL;
+            p = (uchar*)o9_string_data(channel);
+            for(i = 0; i < o9_string_len(channel); i++)
+                room = (room ^ p[i]) * 16777619UL;
+            snprint(path, sizeof path, "%s/%08lux-%08lux.o9h", dir, server, room);
+            out = o9_string_from_c(path);
+        }
+        free(dir);
+    }
+    return out;
+}
+
+// The file contains "O9H1", a little-endian raw size, and one zlib block.
+function IrcHistoryLoadRaw(string path) string {
+    use { flate }
+    string out;
+    c {
+        static int ready;
+        char *name;
+        uchar *packed, *plain;
+        Dir *d;
+        int fd, got, n, size;
+        ulong rawsize;
+
+        out = o9_string_from_c("");
+        name = o9_string_cstr(path);
+        if(name != nil && (d = dirstat(name)) != nil){
+            size = d->length;
+            free(d);
+            if(size >= 14 && size <= 1048576){
+                fd = open(name, OREAD);
+                if(fd >= 0){
+                    packed = malloc(size);
+                    if(packed != nil){
+                        got = 0;
+                        while(got < size){
+                            n = read(fd, packed + got, size - got);
+                            if(n <= 0)
+                                break;
+                            got += n;
+                        }
+                        if(got == size && memcmp(packed, "O9H1", 4) == 0 &&
+                           ((packed[8]<<8) | packed[9]) % 31 == 0 &&
+                           (packed[8] & 15) == 8 && (packed[8] & 0xF0) <= 0x70){
+                            rawsize = packed[4] | packed[5]<<8 | packed[6]<<16 | packed[7]<<24;
+                            if(rawsize > 0 && rawsize <= 8*1048576){
+                                plain = malloc(rawsize);
+                                if(plain != nil){
+                                    if(!ready){
+                                        ready = inflateinit() == FlateOk;
+                                    }
+                                    if(ready){
+                                        n = inflateblock(plain, rawsize, packed + 10, size - 10);
+                                        if(n == rawsize &&
+                                           adler32(1, plain, n) ==
+                                           ((ulong)packed[size-4]<<24 |
+                                            (ulong)packed[size-3]<<16 |
+                                            (ulong)packed[size-2]<<8 |
+                                            (ulong)packed[size-1]))
+                                            out = o9_string_new((char*)plain, rawsize);
+                                    }
+                                    free(plain);
+                                }
+                            }
+                        }
+                        free(packed);
+                    }
+                    close(fd);
+                }
+            }
+        }
+        free(name);
+    }
+    return out;
+}
+
+// 1 means saved, 0 means the compressed data is over limit, -1 means I/O failed.
+function IrcHistorySaveRaw(string path, string content, int64 maximum) int64 {
+    use { flate }
+    int64 out;
+    c {
+        static int ready;
+        char *name;
+        uchar *packed;
+        vlong rawsize;
+        int cap, size, fd;
+
+        out = -1;
+        name = o9_string_cstr(path);
+        rawsize = o9_string_len(content);
+        if(name != nil && maximum >= 4096 && maximum <= 1048576 &&
+           rawsize > 4*maximum)
+            out = 0;
+        if(name != nil && maximum >= 4096 && maximum <= 1048576 &&
+           rawsize > 0 && rawsize <= 4*maximum){
+            if(!ready)
+                ready = deflateinit() == FlateOk;
+            if(ready){
+                cap = 256;
+                while(cap < rawsize*2 + 128)
+                    cap *= 2;
+                packed = malloc(cap);
+                if(packed != nil){
+                    size = deflatezlibblock(packed + 8, cap - 8,
+                        (uchar*)o9_string_data(content), rawsize, 6, 0);
+                    if(size >= 0){
+                        size += 8;
+                        if(size > maximum)
+                            out = 0;
+                        else{
+                            memmove(packed, "O9H1", 4);
+                            packed[4] = rawsize;
+                            packed[5] = rawsize >> 8;
+                            packed[6] = rawsize >> 16;
+                            packed[7] = rawsize >> 24;
+                            fd = create(name, OWRITE|OTRUNC, 0600);
+                            if(fd >= 0){
+                                if(write(fd, packed, size) == size)
+                                    out = 1;
+                                close(fd);
+                            }
+                        }
+                    }
+                    free(packed);
+                }
+            }
+        }
+        free(name);
+    }
+    return out;
+}
+
+// On overflow, discard the oldest quarter at a line boundary.
+function IrcHistoryDropOldRaw(string content) string {
+    string out;
+    c {
+        uchar *p;
+        vlong i, size;
+
+        size = o9_string_len(content);
+        p = (uchar*)o9_string_data(content);
+        i = size / 4;
+        while(i < size && p[i] != '\n')
+            i++;
+        if(i < size)
+            i++;
+        out = o9_string_new((char*)p + i, size - i);
+    }
+    return out;
+}
+
+function IrcHistoryLimitRaw(string value) int64 {
+    int64 out;
+    c {
+        char *s, *end;
+        vlong n;
+
+        out = 262144;
+        s = o9_string_cstr(value);
+        if(s != nil && s[0] != 0){
+            n = strtoll(s, &end, 10);
+            if(*end == 0 && (n == 0 || (n >= 4096 && n <= 1048576)))
+                out = n;
+        }
+        free(s);
+    }
+    return out;
+}

@@ -1,0 +1,36 @@
+#!/bin/rc
+# Copy o9irc sources and build with a private, current o9c toolchain.
+if(! ~ $#* 2){
+	echo 'usage: install-dev9p.rc source-directory toolchain-directory' >[1=2]
+	exit usage
+}
+source=$1
+tool=$2
+out=$home/src/o9irc
+if(! test -d $out)
+	mkdir $out
+if(! test -d $out)
+	exit mkdir
+for(f in irc.o9 ircfs.o9 gui.o9 protocol.o9 history.o9 uiio.o9){
+	if(! cp $source/$f $out/$f)
+		exit copy
+}
+if(! rc $source/deploy/o9build-private.rc $tool $out/irc.o9)
+	exit build
+if(! rc $source/deploy/o9build-private.rc $tool $out/ircfs.o9)
+	exit build
+if(! rc $source/deploy/o9build-private.rc $tool $out/gui.o9)
+	exit build
+if(! cp $out/irc $home/bin/$objtype/o9irc-client)
+	exit install
+if(! cp $out/ircfs $home/bin/$objtype/o9ircfs)
+	exit install
+if(! cp $out/gui $home/bin/$objtype/o9irc-gui)
+	exit install
+if(! test -d $home/bin/rc)
+	mkdir $home/bin/rc
+if(! cp $source/deploy/start.rc $home/bin/rc/o9irc-start)
+	exit install
+chmod +x $home/bin/rc/o9irc-start
+ls -l $home/bin/$objtype/o9irc-client $home/bin/$objtype/o9ircfs $home/bin/$objtype/o9irc-gui $home/bin/rc/o9irc-start
+echo O9IRC_INSTALLED

@@ -1,0 +1,23 @@
+#!/bin/rc
+# Build a private o9c toolchain without changing the machine-wide install.
+if(! ~ $#* 2){
+	echo 'usage: build-toolchain.rc source.tar output-directory' >[1=2]
+	exit usage
+}
+archive=$1
+out=$2
+if(test -e $out){
+	echo 'toolchain directory already exists: '^$out >[1=2]
+	exit exists
+}
+if(! mkdir $out)
+	exit mkdir
+cd $out
+if(! tar xf $archive)
+	exit extract
+if(! mk >build.log >[2=1]){
+	tail -40 build.log
+	exit build
+}
+ls -l o9c/o9c libo9.a
+echo O9IRC_TOOLCHAIN_READY

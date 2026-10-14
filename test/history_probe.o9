@@ -1,0 +1,61 @@
+import "history.o9";
+import "file.o9";
+import "string.o9";
+
+function IrcHistoryNoiseRaw() string {
+    string out;
+    c {
+        uchar data[6000];
+        ulong state;
+        int i;
+
+        state = 0x12345678;
+        for(i = 0; i < sizeof data; i++){
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data[i] = state >> 16;
+        }
+        out = o9_string_new((char*)data, sizeof data);
+    }
+    return out;
+}
+
+main {
+    string path = "/tmp/o9irc-history-probe.o9h";
+    int64 count = 1;
+    while(count <= 800) {
+        Task<string> repeated = spawn StringRepeatRaw("[2026-10-10 12:00:00] <alice> repeated message\n", count);
+        string content = repeated.await();
+        Task<int64> saved = spawn IrcHistorySaveRaw(path, content, 4096);
+        if(saved.await() != 1) {
+            print("HISTORY_SAVE_FAIL ", count, "\n");
+        } else {
+            Task<int64> size = spawn FileSizeRaw(path);
+            Task<string> loaded = spawn IrcHistoryLoadRaw(path);
+            string recovered = loaded.await();
+            if(size.await() > 4096 || cmp(recovered, content) != 0) {
+                print("HISTORY_ROUNDTRIP_FAIL count=", count, " size=", size.await(),
+                      " raw=", len(content), " recovered=", len(recovered), "\n");
+            } else {
+                print("HISTORY_ROUNDTRIP_OK ", count, "\n");
+            }
+        }
+        count = count * 10;
+    }
+    Task<string> noise = spawn IrcHistoryNoiseRaw();
+    Task<int64> rejected = spawn IrcHistorySaveRaw(path, noise.await(), 4096);
+    Task<int64> size = spawn FileSizeRaw(path);
+    if(rejected.await() != 0 || size.await() > 4096) {
+        print("HISTORY_LIMIT_FAIL\n");
+    } else {
+        print("HISTORY_LIMIT_OK\n");
+    }
+    Task<string> oversized = spawn StringRepeatRaw("very compressible line\n", 800);
+    Task<int64> evict = spawn IrcHistorySaveRaw(path, oversized.await(), 4096);
+    if(evict.await() != 0) {
+        print("HISTORY_RAW_LIMIT_FAIL\n");
+    } else {
+        print("HISTORY_RAW_LIMIT_OK\n");
+    }
+}

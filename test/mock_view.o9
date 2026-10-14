@@ -1,0 +1,87 @@
+// Fixed 9P fixture for exercising the Rio client without an IRC connection.
+import "process.o9";
+
+interface ViewController {
+    internal method FileTree display(string id, string caller);
+    internal method string readText(string id, string path);
+    internal method int64 writeText(string id, string path, int64 offset, string text, bool truncate);
+}
+
+class MockNetwork {
+    private FileTree files;
+    private string sent;
+
+    method MockNetwork() {
+        files = new FileTree();
+        files.text("status", "connected to mock\n", false);
+        files.text("events", ":mock 001 test :welcome\n", false);
+        files.text("statuslog", ":mock 001 test :welcome\n", false);
+        files.text("conversations", "channels/2366697874757265\t#fixture\nchannels/236f74686572\t#other\nusers/616c696365\talice\n", false);
+        files.dir("channels");
+        files.dir("users");
+        files.dir("channels/2366697874757265");
+        files.dir("channels/236f74686572");
+        files.dir("users/616c696365");
+        files.text("channels/2366697874757265/topic", "Synthetic 9P view\n", false);
+        files.text("channels/2366697874757265/nicks", "@alice\nbob\n", false);
+        files.text("channels/2366697874757265/transcript", "<alice> fixture hello\n", false);
+        files.text("channels/236f74686572/topic", "Other channel\n", false);
+        files.text("channels/236f74686572/nicks", "@carol\n", false);
+        files.text("channels/236f74686572/transcript", "<carol> other hello\n", false);
+        files.text("users/616c696365/topic", "Private conversation\n", false);
+        files.text("users/616c696365/nicks", "", false);
+        files.text("users/616c696365/transcript", "<alice> private hello\n", false);
+        files.text("channel", "#fixture\n", false);
+        files.text("topic", "Synthetic 9P view\n", false);
+        files.text("nicks", "@alice\nbob\n", false);
+        files.text("transcript", "<alice> fixture hello\n", false);
+        files.text("sent", "", false);
+        files.register("o9irc.mock.network");
+        sent = "";
+    }
+
+    internal method int64 command(string value) {
+        sent = cat(sent, value);
+        files.text("sent", sent, false);
+        return len(value);
+    }
+}
+
+class MockViews {
+    ViewController;
+    private MockNetwork network;
+
+    method MockViews(MockNetwork model) {
+        network = model;
+    }
+
+    internal method FileTree display(string id, string caller) {
+        FileTree root = new FileTree();
+        root.dir("networks");
+        root.dir("networks/default");
+        root.live("networks/default/input", true);
+        MountTable mounts = new MountTable();
+        mounts.view("networks/default", "o9irc.mock.network", 1);
+        root.apply(mounts);
+        mounts.close();
+        return root;
+    }
+
+    internal method string readText(string id, string path) {
+        return "";
+    }
+
+    internal method int64 writeText(string id, string path, int64 offset, string text, bool truncate) {
+        if(cmp(path, "networks/default/input") != 0 || offset != 0) {
+            return -1;
+        }
+        return network.command(text);
+    }
+}
+
+main {
+    MockNetwork network = new MockNetwork();
+    MockViews views = new MockViews(network);
+    viewController(views);
+    serve();
+}

@@ -1,0 +1,1223 @@
+// IRC network actor with a composable 9P view. A GUI mounts this service.
+import "protocol.o9";
+import "history.o9";
+import "file.o9";
+import "process.o9";
+import "time.o9";
+
+interface ViewController {
+    internal method FileTree display(string id, string caller);
+    internal method string readText(string id, string path);
+    internal method int64 writeText(string id, string path, int64 offset, string text, bool truncate);
+}
+
+// IRC targets become case-folded, path-safe 9P names. The displayed name
+// remains the spelling supplied by the server or user.
+function IrcViewKeyRaw(string target) string {
+    string out;
+    c {
+        static char hex[] = "0123456789abcdef";
+        char key[129];
+        uchar *p;
+        int i, n, ch;
+
+        p = (uchar*)o9_string_data(target);
+        n = o9_string_len(target);
+        if(n > 64)
+            n = 64;
+        for(i = 0; i < n; i++){
+            ch = p[i];
+            if(ch >= 'A' && ch <= 'Z')
+                ch += 'a' - 'A';
+            else if(ch == '{')
+                ch = '[';
+            else if(ch == '}')
+                ch = ']';
+            else if(ch == '|')
+                ch = '\\';
+            else if(ch == '^')
+                ch = '~';
+            key[2*i] = hex[(ch >> 4) & 15];
+            key[2*i+1] = hex[ch & 15];
+        }
+        key[2*n] = 0;
+        out = o9_string_from_c(key);
+    }
+    return out;
+}
+
+function IrcValidTargetRaw(string target) bool {
+    bool out;
+    c {
+        uchar *p;
+        int i, n;
+
+        p = (uchar*)o9_string_data(target);
+        n = o9_string_len(target);
+        out = n > 0 && n <= 64;
+        for(i = 0; i < n; i++)
+            if(p[i] <= ' ' || p[i] == ',' || p[i] == '/' || p[i] == 127)
+                out = 0;
+    }
+    return out;
+}
+
+function IrcIsChannelRaw(string target) bool {
+    bool out;
+    c {
+        char *p;
+        p = o9_string_data(target);
+        out = o9_string_len(target) > 1 &&
+            (p[0] == '#' || p[0] == '&' || p[0] == '+' || p[0] == '!');
+    }
+    return out;
+}
+
+function IrcSenderRaw(string line) string {
+    string out;
+    c {
+        char *p, *start;
+        int n;
+
+        p = o9_string_data(line);
+        if(*p == '@'){
+            p = strchr(p, ' ');
+            if(p != nil)
+                p++;
+        }
+        start = p;
+        if(start != nil && *start == ':'){
+            start++;
+            p = start;
+            while(*p != 0 && *p != '!' && *p != ' ')
+                p++;
+            n = p - start;
+            out = o9_string_new(start, n);
+        }else
+            out = o9_string_from_c("");
+    }
+    return out;
+}
+
+function IrcTrailingRaw(string payload) string {
+    string out;
+    c {
+        char *p;
+        p = strstr(o9_string_data(payload), " :");
+        out = p != nil ? o9_string_from_c(p+2) : o9_string_from_c("");
+    }
+    return out;
+}
+
+// The network pump has one reader. Keep incomplete frames in one bounded
+// buffer so receiving a line does not create an actor for every slice.
+function IrcReadLineRaw(string token) string {
+    string out;
+    c {
+        static char pending[8192];
+        static int used, previous = -1;
+        char *end, *name;
+        int fd, n, size;
+
+        out = o9_string_from_c("");
+        name = o9_string_cstr(token);
+        if(name != nil){
+            fd = atoi(name);
+            free(name);
+            if(fd != previous){
+                used = 0;
+                previous = fd;
+            }
+            for(;;){
+                end = memchr(pending, '\n', used);
+                if(end != nil){
+                    size = end - pending;
+                    n = size + 1;
+                    if(size > 0 && pending[size-1] == '\r')
+                        size--;
+                    if(size > 0){
+                        o9_string_release(out);
+                        out = o9_string_new(pending, size);
+                    }
+                    used -= n;
+                    memmove(pending, pending + n, used);
+                    if(size > 0)
+                        break;
+                    continue;
+                }
+                if(used == sizeof pending){
+                    used = 0;
+                    previous = -1;
+                    break;
+                }
+                n = read(fd, pending + used, sizeof pending - used);
+                if(n <= 0){
+                    used = 0;
+                    previous = -1;
+                    break;
+                }
+                used += n;
+            }
+        }
+    }
+    return out;
+}
+
+function IrcFormatChatRaw(string stamp, string sender, string body) string {
+    string out;
+    c {
+        char *buf;
+        vlong n;
+
+        n = o9_string_len(stamp) + o9_string_len(sender) +
+            o9_string_len(body) + 8;
+        out = o9_string_from_c("");
+        if(n > 0 && n <= 16384 && (buf = malloc(n + 1)) != nil){
+            n = snprint(buf, n + 1, "[%.*s] <%.*s> %.*s\n",
+                (int)o9_string_len(stamp), o9_string_data(stamp),
+                (int)o9_string_len(sender), o9_string_data(sender),
+                (int)o9_string_len(body), o9_string_data(body));
+            o9_string_release(out);
+            out = o9_string_new(buf, n);
+            free(buf);
+        }
+    }
+    return out;
+}
+
+// One local connection profile. The last two fields are transport and
+// trusted-keys path. Five-field profiles from older versions remain valid.
+function IrcProfileValidRaw(string value) bool {
+    bool out;
+    c {
+        uchar *p;
+        vlong n, i;
+        int field, width, port, tls;
+
+        p = (uchar*)o9_string_data(value);
+        n = o9_string_len(value);
+        out = n > 0 && n <= 768;
+        field = 0;
+        width = 0;
+        port = 0;
+        tls = 0;
+        for(i = 0; out && i < n; i++){
+            if(p[i] == '\t'){
+                if(field == 0 && (width == 0 || width > 253)) out = 0;
+                if(field == 1 && (width == 0 || width > 5 || port < 1 || port > 65535)) out = 0;
+                if(field == 2 && (width == 0 || width > 30)) out = 0;
+                if(field == 3 && width > 64) out = 0;
+                if(field == 4 && width > 80) out = 0;
+                if(field == 5 && width != 3) out = 0;
+                field++;
+                width = 0;
+                continue;
+            }
+            if(p[i] < 32 || p[i] == 127 || field > 6) { out = 0; break; }
+            if(field == 0 && (p[i] == '!' || p[i] == '/' || p[i] == ' ')) out = 0;
+            if(field == 1){
+                if(p[i] < '0' || p[i] > '9') out = 0;
+                else if(width >= 5) out = 0;
+                else port = port*10 + p[i]-'0';
+            }
+            if((field == 2 || field == 3) && (p[i] <= ' ' || p[i] == ',' || p[i] == '/')) out = 0;
+            if(field == 3 && width == 0 && p[i] != '#' && p[i] != '&' &&
+               p[i] != '+' && p[i] != '!') out = 0;
+            if(field == 5){
+                if(width == 0 && p[i] != 't') out = 0;
+                if(width == 1){
+                    if(p[i] == 'l') tls = 1;
+                    else if(p[i] != 'c') out = 0;
+                }
+                if(width == 2 && p[i] != (tls ? 's' : 'p')) out = 0;
+            }
+            if(field == 6 && (width == 0 && p[i] != '/' || p[i] == '\\')) out = 0;
+            width++;
+        }
+        if(field == 4 && width > 80) out = 0;
+        else if(field == 6 && (width > 255 || (tls && width == 0))) out = 0;
+        else if(field != 4 && field != 6) out = 0;
+    }
+    return out;
+}
+
+function IrcProfileLoadRaw(string path) string {
+    string out;
+    c {
+        char *name;
+        char buf[769];
+        int fd, n;
+
+        out = o9_string_from_c("");
+        name = o9_string_cstr(path);
+        if(name != nil && (fd = open(name, OREAD)) >= 0){
+            n = read(fd, buf, sizeof buf);
+            if(n > 0 && n <= 768){
+                o9_string_release(out);
+                out = o9_string_new(buf, n);
+            }
+            close(fd);
+        }
+        free(name);
+    }
+    return out;
+}
+
+function IrcProfileSaveRaw(string path, string value) bool {
+    bool out;
+    c {
+        char *name;
+        int fd;
+        vlong n;
+
+        out = 0;
+        name = o9_string_cstr(path);
+        if(name != nil && (fd = create(name, OWRITE, 0600)) >= 0){
+            n = o9_string_len(value);
+            out = write(fd, o9_string_data(value), n) == n;
+            close(fd);
+        }
+        free(name);
+    }
+    return out;
+}
+
+// tlsClient consumes the TCP descriptor on success. Its returned descriptor
+// carries plaintext IRC bytes through the kernel TLS device. A connection is
+// usable only when its presented certificate matches the trusted-keys file.
+function IrcDialTLSRaw(string address, string host, string trustPath) string {
+    use { sec }
+    string out;
+    c {
+        char *addr, *server, *file;
+        char descriptor[32];
+        char statusPath[64], status[512], *versionText;
+        int raw, data, statusfd, n;
+        long version;
+        TLSconn conn;
+        Thumbprint *thumb;
+
+        out = o9_string_from_c("error:TLS connection failed");
+        addr = o9_string_cstr(address);
+        server = o9_string_cstr(host);
+        file = o9_string_cstr(trustPath);
+        raw = -1;
+        data = -1;
+        thumb = nil;
+        memset(&conn, 0, sizeof conn);
+        if(file == nil || file[0] != '/' || access(file, AREAD) < 0){
+            o9_string_release(out);
+            out = o9_string_from_c("error:TLS trusted-keys file is missing or unreadable");
+            goto irctlsdone;
+        }
+        thumb = initThumbprints(file, nil, "x509");
+        if(thumb == nil){
+            o9_string_release(out);
+            out = o9_string_from_c("error:TLS trusted-keys file could not be loaded");
+            goto irctlsdone;
+        }
+        if(addr == nil || server == nil || (raw = dial(addr, nil, nil, nil)) < 0)
+            goto irctlsdone;
+        conn.serverName = server;
+        data = tlsClient(raw, &conn);
+        if(data < 0){
+            o9_string_release(out);
+            out = o9_string_from_c("error:TLS handshake failed");
+            goto irctlsdone;
+        }
+        raw = -1;
+        if(conn.cert == nil || !okCertificate(conn.cert, conn.certlen, thumb)){
+            o9_string_release(out);
+            out = o9_string_from_c("error:TLS certificate does not match trusted keys");
+            goto irctlsdone;
+        }
+        snprint(statusPath, sizeof statusPath, "%s/status", conn.dir);
+        statusfd = open(statusPath, OREAD);
+        n = statusfd >= 0 ? read(statusfd, status, sizeof status-1) : -1;
+        if(statusfd >= 0) close(statusfd);
+        if(n > 0) status[n] = 0;
+        versionText = n > 0 ? strstr(status, "Version: ") : nil;
+        version = versionText != nil ? strtol(versionText+9, nil, 0) : 0;
+        if(version < 0x0303){
+            o9_string_release(out);
+            out = o9_string_from_c("error:TLS version below 1.2 or unavailable");
+            goto irctlsdone;
+        }
+        o9_string_release(out);
+        snprint(descriptor, sizeof descriptor, "%d", data);
+        out = o9_string_from_c(descriptor);
+        data = -1;
+    irctlsdone:
+        if(data >= 0) close(data);
+        if(raw >= 0) close(raw);
+        free(conn.cert);
+        free(conn.sessionID);
+        if(thumb != nil) freeThumbprints(thumb);
+        free(addr);
+        free(server);
+        free(file);
+    }
+    return out;
+}
+
+class IrcNetwork {
+    private FileTree files;
+    private string fd;
+    private string channel;
+    private string activeKey;
+    private string nick;
+    private string registrationBase;
+    private int64 nickFallbacks;
+    private bool registered;
+    private bool dialing;
+    private string events;
+    private string statuslog;
+    private string address;
+    private string realName;
+    private string transport;
+    private string trustPath;
+    private string serverHost;
+    private string profilePath;
+    private string historyDirectory;
+    private string historyIndexPath;
+    private int64 historyLimit;
+    private int64 conversationCount;
+    private string conversations;
+    private string channelsToJoin;
+    private bool restoring;
+    private Dict<string,string> labels;
+    private Dict<string,string> transcripts;
+    private Dict<string,string> topics;
+    private Dict<string,string> names;
+    private Dict<string,string> historyPaths;
+    private Dict<string,string> historyWritable;
+    private Dict<string,string> namesReceiving;
+
+    method IrcNetwork(string firstChannel, string initialNick, string server,
+                      string directory, int64 maximum) {
+        files = new FileTree();
+        files.text("status", "connecting\n", false);
+        if(len(server) == 0) { files.text("status", "disconnected\n", false); }
+        files.text("events", "", false);
+        files.text("statuslog", "", false);
+        files.text("conversations", "", false);
+        files.dir("channels");
+        files.dir("users");
+        // Legacy selected-channel files remain readable for older clients.
+        files.text("channel", "", false);
+        files.text("transcript", "", false);
+        files.text("topic", "", false);
+        files.text("nicks", "", false);
+        files.text("historypath", "", false);
+        files.text("historystatus", "disabled\n", false);
+        profilePath = cat(directory, "/connection");
+        Task<string> savedProfile = spawn IrcProfileLoadRaw(profilePath);
+        string profile = savedProfile.take();
+        Task<bool> validProfile = spawn IrcProfileValidRaw(profile);
+        if(!validProfile.take()) {
+            profile.dispose();
+            profile = "\t6667\t\t\t";
+        }
+        files.text("profile", profile, false);
+        files.register("o9irc.network.default");
+        fd = "";
+        channel = "";
+        activeKey = "";
+        nick = initialNick;
+        registrationBase = cat(initialNick, "");
+        nickFallbacks = 0;
+        registered = false;
+        dialing = len(server) > 0;
+        events = "";
+        statuslog = "";
+        address = server;
+        realName = "";
+        transport = "tcp";
+        trustPath = "";
+        serverHost = "";
+        historyDirectory = directory;
+        historyIndexPath = "";
+        historyLimit = maximum;
+        conversationCount = 0;
+        conversations = "";
+        channelsToJoin = "";
+        restoring = false;
+        if(historyLimit > 0) {
+            Task<int64> directoryReady = spawn FileMkdirAllRaw(historyDirectory);
+            if(directoryReady.take() != 0) {
+                Task<string> indexPath = spawn IrcHistoryIndexPathRaw(historyDirectory, address);
+                historyIndexPath = indexPath.take();
+                restoreHistoryIndex();
+            }
+        }
+        if(len(firstChannel) > 0) {
+            Task<bool> valid = spawn IrcValidTargetRaw(firstChannel);
+            Task<bool> isChannel = spawn IrcIsChannelRaw(firstChannel);
+            bool allowed = valid.take();
+            bool room = isChannel.take();
+            if(allowed && room) {
+                string key = ensureConversation("channels", firstChannel);
+                if(len(key) > 0) {
+                    channel = firstChannel;
+                    activeKey = key;
+                    showLegacyChannel(key);
+                }
+            }
+        }
+    }
+
+    internal method void restoreHistoryIndex() {
+        Task<string> savedIndex = spawn IrcHistoryIndexLoadRaw(historyIndexPath);
+        string saved = savedIndex.take();
+        Task<int64> count = spawn StringCountRaw(saved, "\n");
+        int64 rows = count.take();
+        restoring = true;
+        int64 i = 0;
+        while(i < rows && i < 64) {
+            Task<string> row = spawn StringFieldRaw(saved, "\n", i);
+            string entry = row.take();
+            Task<string> key = spawn StringFieldRaw(entry, "\t", 0);
+            Task<string> name = spawn StringFieldRaw(entry, "\t", 1);
+            string previousKey = key.take();
+            string target = name.take();
+            Task<int64> channelPrefix = spawn StringStartsWithRaw(previousKey, "channels/");
+            Task<int64> userPrefix = spawn StringStartsWithRaw(previousKey, "users/");
+            if(channelPrefix.take() != 0) { ensureConversation("channels", target); }
+            else if(userPrefix.take() != 0) { ensureConversation("users", target); }
+            i = i + 1;
+        }
+        restoring = false;
+    }
+
+    internal method string ensureConversation(string kind, string target) {
+        Task<bool> valid = spawn IrcValidTargetRaw(target);
+        if(!valid.take()) { return ""; }
+        Task<string> encoded = spawn IrcViewKeyRaw(target);
+        string code = encoded.take();
+        string prefix = cat(kind, "/");
+        string key = cat(prefix, code);
+        prefix.dispose();
+        code.dispose();
+        if(labels.Has(key)) { return key; }
+        if(conversationCount >= 64) {
+            appendStatus("o9irc: conversation limit reached");
+            return "";
+        }
+        files.dir(key);
+        files.text(cat(key, "/name"), cat(target, "\n"), false);
+        files.text(cat(key, "/kind"), cat(kind, "\n"), false);
+        files.text(cat(key, "/transcript"), "", false);
+        files.text(cat(key, "/topic"), "", false);
+        files.text(cat(key, "/nicks"), "", false);
+        files.text(cat(key, "/historypath"), "", false);
+        files.text(cat(key, "/historystatus"), "disabled\n", false);
+        labels[key] = target;
+        transcripts[key] = "";
+        topics[key] = "";
+        names[key] = "";
+        historyPaths[key] = "";
+        historyWritable[key] = "no";
+        namesReceiving[key] = "no";
+        conversationCount = conversationCount + 1;
+        conversations = cat(conversations, cat(cat(key, "\t"), cat(target, "\n")));
+        files.text("conversations", conversations, false);
+        if(cmp(kind, "channels") == 0) {
+            channelsToJoin = cat(channelsToJoin, cat(target, "\n"));
+        }
+        if(!restoring && len(historyIndexPath) > 0) {
+            Task<bool> savedIndex = spawn IrcHistoryIndexSaveRaw(historyIndexPath, conversations);
+            savedIndex.take();
+        }
+        loadHistory(key);
+        return key;
+    }
+
+    internal method void loadHistory(string key) {
+        if(historyLimit > 0) {
+            Task<int64> directory = spawn FileMkdirAllRaw(historyDirectory);
+            if(directory.take() != 0) {
+                Task<string> path = spawn IrcHistoryPathRaw(historyDirectory, address, key);
+                string name = path.take();
+                historyPaths[key] = name;
+                Task<string> loaded = spawn IrcHistoryLoadRaw(name);
+                string saved = loaded.take();
+                Task<int64> exists = spawn FileExistsRaw(name);
+                int64 present = exists.take();
+                Task<int64> channelPrefix = spawn StringStartsWithRaw(key, "channels/");
+                int64 oldChannel = channelPrefix.take();
+                if(present == 0 && len(saved) == 0 && oldChannel != 0) {
+                    Task<string> oldPath = spawn IrcHistoryPathRaw(historyDirectory, address, labels[key]);
+                    Task<string> old = spawn IrcHistoryLoadRaw(oldPath.take());
+                    saved = old.take();
+                    if(len(saved) > 0) {
+                        Task<int64> migrated = spawn IrcHistorySaveRaw(name, saved, historyLimit);
+                        migrated.take();
+                    }
+                }
+                if(present != 0 && len(saved) == 0) {
+                    files.text(cat(key, "/historystatus"), "cannot read history file\n", false);
+                } else {
+                    transcripts[key] = saved;
+                    files.text(cat(key, "/transcript"), saved, false);
+                    historyWritable[key] = "yes";
+                    files.text(cat(key, "/historystatus"), "saved\n", false);
+                }
+                files.text(cat(key, "/historypath"), cat(name, "\n"), false);
+            } else {
+                files.text(cat(key, "/historystatus"), "cannot create history directory\n", false);
+            }
+        }
+    }
+
+    internal method void showLegacyChannel(string key) {
+        files.text("channel", cat(channel, "\n"), false);
+        files.text("transcript", transcripts[key], false);
+        files.text("topic", topics[key], false);
+        files.text("nicks", names[key], false);
+        files.text("historypath", cat(historyPaths[key], "\n"), false);
+        if(cmp(historyWritable[key], "yes") == 0) {
+            files.text("historystatus", "saved\n", false);
+        } else {
+            files.text("historystatus", "disabled\n", false);
+        }
+    }
+
+    internal method void appendStatus(string line) {
+        string suffix = cat(line, "\n");
+        string next = cat(statuslog, suffix);
+        suffix.dispose();
+        statuslog.dispose();
+        statuslog = next;
+        if(len(statuslog) > 32768) {
+            Task<string> tail = spawn StringSliceRaw(statuslog, len(statuslog) - 32768, 32768);
+            string clipped = tail.take();
+            statuslog.dispose();
+            statuslog = clipped;
+        }
+        files.text("statuslog", statuslog, false);
+    }
+
+    internal method bool recordChat(string key, string sender, string body) {
+        if(len(key) == 0 || !transcripts.Has(key)) { return false; }
+        Task<int64> now = spawn TimeNowRaw();
+        Task<string> stamp = spawn DateTimeStampRaw(now.take());
+        string time = stamp.take();
+        Task<string> formatted = spawn IrcFormatChatRaw(time, sender, body);
+        string line = formatted.take();
+        time.dispose();
+        string next = cat(transcripts[key], line);
+        line.dispose();
+        bool stored = false;
+        if(cmp(historyWritable[key], "yes") == 0 && historyLimit > 0) {
+            bool trying = true;
+            while(len(next) > 0 && !stored && trying) {
+                Task<int64> saved = spawn IrcHistorySaveRaw(historyPaths[key], next, historyLimit);
+                int64 result = saved.take();
+                if(result == 1) {
+                    stored = true;
+                    string statusPath = cat(key, "/historystatus");
+                    files.text(statusPath, "saved\n", false);
+                    statusPath.dispose();
+                } else if(result < 0) {
+                    string statusPath = cat(key, "/historystatus");
+                    files.text(statusPath, "write failed\n", false);
+                    statusPath.dispose();
+                    historyWritable[key] = "no";
+                    trying = false;
+                } else {
+                    Task<string> cut = spawn IrcHistoryDropOldRaw(next);
+                    string shorter = cut.take();
+                    if(len(shorter) >= len(next)) {
+                        trying = false;
+                        shorter.dispose();
+                    } else {
+                        next.dispose();
+                        next = shorter;
+                    }
+                }
+            }
+        }
+        if(!stored) {
+            bool dropping = true;
+            while(len(next) > 32768 && dropping) {
+                Task<string> cut = spawn IrcHistoryDropOldRaw(next);
+                string shorter = cut.take();
+                if(len(shorter) >= len(next)) {
+                    dropping = false;
+                    shorter.dispose();
+                } else {
+                    next.dispose();
+                    next = shorter;
+                }
+            }
+        }
+        transcripts[key] = next;
+        string transcriptPath = cat(key, "/transcript");
+        files.text(transcriptPath, next, false);
+        transcriptPath.dispose();
+        if(cmp(key, activeKey) == 0) {
+            files.text("transcript", next, false);
+        }
+        next.dispose();
+        return true;
+    }
+
+    internal method string channelKey() {
+        Task<string> encoded = spawn IrcViewKeyRaw(channel);
+        return encoded.take();
+    }
+
+    internal method void connected(string token) {
+        fd = token;
+        dialing = false;
+        files.text("status", "connected\n", false);
+    }
+
+    internal method void closed() {
+        if(len(fd) > 0) {
+            Task<int64> stopped = spawn NetCloseRaw(fd);
+            stopped.take();
+        }
+        fd = "";
+        dialing = false;
+        files.text("status", "closed\n", false);
+    }
+
+    internal method string connectionAddress() { return address; }
+    internal method string connectionNick() { return nick; }
+    internal method string connectionName() { return realName; }
+    internal method string connectionTransport() { return transport; }
+    internal method string connectionTrustPath() { return trustPath; }
+    internal method string connectionHost() { return serverHost; }
+    internal method void connectionError(string message) { appendStatus(message); }
+
+    internal method bool configure(string value, bool connectNow) {
+        Task<bool> valid = spawn IrcProfileValidRaw(value);
+        if(!valid.take()) {
+            appendStatus("o9irc: invalid connection settings");
+            return false;
+        }
+        if(connectNow && (len(fd) > 0 || dialing)) {
+            appendStatus("o9irc: disconnect before connecting to another server");
+            return false;
+        }
+        Task<int64> directory = spawn FileMkdirAllRaw(historyDirectory);
+        if(directory.take() == 0) { return false; }
+        Task<bool> saved = spawn IrcProfileSaveRaw(profilePath, value);
+        if(!saved.take()) { return false; }
+        files.text("profile", value, false);
+        if(!connectNow) { return true; }
+        Task<string> hostPart = spawn StringFieldRaw(value, "\t", 0);
+        Task<string> portPart = spawn StringFieldRaw(value, "\t", 1);
+        Task<string> nickPart = spawn StringFieldRaw(value, "\t", 2);
+        Task<string> channelPart = spawn StringFieldRaw(value, "\t", 3);
+        Task<string> namePart = spawn StringFieldRaw(value, "\t", 4);
+        Task<string> transportPart = spawn StringFieldRaw(value, "\t", 5);
+        Task<string> trustPart = spawn StringFieldRaw(value, "\t", 6);
+        string host = hostPart.take();
+        string port = portPart.take();
+        string nextNick = nickPart.take();
+        string nextChannel = channelPart.take();
+        string nextName = namePart.take();
+        string nextTransport = transportPart.take();
+        string nextTrust = trustPart.take();
+        string nextAddress = cat(cat(cat("tcp!", host), "!"), port);
+        if(len(address) > 0 && (cmp(address, nextAddress) != 0 ||
+            cmp(transport, nextTransport) != 0) && conversationCount > 0) {
+            appendStatus("o9irc: restart the service before changing servers");
+            host.dispose(); port.dispose(); nextNick.dispose(); nextChannel.dispose();
+            nextName.dispose(); nextAddress.dispose(); nextTransport.dispose();
+            nextTrust.dispose();
+            return false;
+        }
+        bool newServer = cmp(address, nextAddress) != 0 ||
+            cmp(transport, nextTransport) != 0;
+        address.dispose();
+        nick.dispose();
+        registrationBase.dispose();
+        realName.dispose();
+        transport.dispose();
+        trustPath.dispose();
+        serverHost.dispose();
+        address = nextAddress;
+        nick = nextNick;
+        registrationBase = cat(nextNick, "");
+        realName = nextName;
+        transport = nextTransport;
+        trustPath = nextTrust;
+        serverHost = cat(host, "");
+        if(newServer && historyLimit > 0) {
+            Task<string> indexPath = spawn IrcHistoryIndexPathRaw(historyDirectory, address);
+            historyIndexPath.dispose();
+            historyIndexPath = indexPath.take();
+            restoreHistoryIndex();
+        }
+        registered = false;
+        nickFallbacks = 0;
+        dialing = true;
+        files.text("status", "connecting\n", false);
+        if(len(nextChannel) > 0) {
+            string key = ensureConversation("channels", nextChannel);
+            if(len(key) > 0) {
+                channel.dispose();
+                activeKey.dispose();
+                channel = nextChannel;
+                activeKey = key;
+                showLegacyChannel(key);
+            }
+        }
+        host.dispose();
+        port.dispose();
+        return true;
+    }
+
+    internal method bool incoming(string line) {
+        Task<string> parsed = spawn IrcPayload(line);
+        string payload = parsed.take();
+        Task<string> commandField = spawn StringFieldRaw(payload, " ", 0);
+        string commandName = commandField.take();
+        if(cmp(commandName, "PING") == 0 && len(fd) > 0) {
+            Task<string> parameter = spawn StringSliceRaw(payload, 5, len(payload) - 5);
+            string token = parameter.take();
+            string response = cat("PONG ", token);
+            Task<bool> pong = spawn IrcSend(fd, response);
+            pong.take();
+            response.dispose();
+            token.dispose();
+        }
+        if(cmp(commandName, "001") == 0 && len(fd) > 0) {
+            registered = true;
+            Task<int64> lineCount = spawn StringCountRaw(channelsToJoin, "\n");
+            int64 lines = lineCount.take();
+            int64 i = 0;
+            while(i < lines) {
+                Task<string> target = spawn StringFieldRaw(channelsToJoin, "\n", i);
+                string room = target.take();
+                string request = cat("JOIN ", room);
+                Task<bool> join = spawn IrcSend(fd, request);
+                join.take();
+                request.dispose();
+                room.dispose();
+                i = i + 1;
+            }
+        }
+        if(cmp(commandName, "433") == 0 && !registered && len(fd) > 0) {
+            if(nickFallbacks < 9) {
+                nickFallbacks = nickFallbacks + 1;
+                Task<string> candidate = spawn IrcNickFallbackRaw(registrationBase, nickFallbacks);
+                string nextNick = candidate.take();
+                string request = cat("NICK ", nextNick);
+                Task<bool> sent = spawn IrcSend(fd, request);
+                if(sent.take()) {
+                    string notice = cat("o9irc: nickname in use; trying ", nextNick);
+                    appendStatus(notice);
+                    notice.dispose();
+                    nick.dispose();
+                    nick = nextNick;
+                } else { nextNick.dispose(); }
+                request.dispose();
+            } else {
+                appendStatus("o9irc: fallback nicknames exhausted; enter /nick name");
+            }
+        }
+        string eventLine = cat(line, "\n");
+        string combined = cat(events, eventLine);
+        eventLine.dispose();
+        events.dispose();
+        events = combined;
+        if(len(events) > 32768) {
+            Task<string> tail = spawn StringSliceRaw(events, len(events) - 32768, 32768);
+            string clipped = tail.take();
+            events.dispose();
+            events = clipped;
+        }
+        files.text("events", events, false);
+        if(cmp(commandName, "PRIVMSG") == 0) {
+            Task<string> targetField = spawn StringFieldRaw(payload, " ", 1);
+            Task<string> senderField = spawn IrcSenderRaw(line);
+            Task<string> bodyField = spawn IrcTrailingRaw(payload);
+            string target = targetField.take();
+            string sender = senderField.take();
+            string body = bodyField.take();
+            Task<bool> isChannel = spawn IrcIsChannelRaw(target);
+            string key = "";
+            if(isChannel.take()) {
+                key = ensureConversation("channels", target);
+            } else if(len(sender) > 0) {
+                key = ensureConversation("users", sender);
+            }
+            if(len(key) > 0) {
+                recordChat(key, sender, body);
+            } else {
+                appendStatus(line);
+            }
+            key.dispose();
+            target.dispose();
+            sender.dispose();
+            body.dispose();
+            payload.dispose();
+            commandName.dispose();
+            return true;
+        }
+        appendStatus(line);
+        if(cmp(commandName, "332") == 0 || cmp(commandName, "TOPIC") == 0) {
+            int64 field = 1;
+            if(cmp(commandName, "332") == 0) { field = 2; }
+            Task<string> target = spawn StringFieldRaw(payload, " ", field);
+            string room = target.take();
+            string key = ensureConversation("channels", room);
+            if(len(key) > 0) {
+                Task<string> value = spawn IrcTrailingRaw(payload);
+                topics[key] = value.take();
+                files.text(cat(key, "/topic"), cat(topics[key], "\n"), false);
+                if(cmp(room, channel) == 0) { files.text("topic", cat(topics[key], "\n"), false); }
+            }
+        }
+        if(cmp(commandName, "353") == 0) {
+            Task<string> target = spawn StringFieldRaw(payload, " ", 3);
+            string room = target.take();
+            string key = ensureConversation("channels", room);
+            if(len(key) > 0) {
+                if(cmp(namesReceiving[key], "yes") != 0) {
+                    names[key] = "";
+                    namesReceiving[key] = "yes";
+                }
+                Task<string> value = spawn IrcTrailingRaw(payload);
+                Task<string> lines = spawn StringReplaceRaw(value.take(), " ", "\n");
+                names[key] = cat(names[key], cat(lines.take(), "\n"));
+                files.text(cat(key, "/nicks"), names[key], false);
+                if(cmp(room, channel) == 0) { files.text("nicks", names[key], false); }
+            }
+        }
+        if(cmp(commandName, "366") == 0) {
+            Task<string> target = spawn StringFieldRaw(payload, " ", 2);
+            Task<string> encoded = spawn IrcViewKeyRaw(target.take());
+            string key = cat("channels/", encoded.take());
+            if(namesReceiving.Has(key)) { namesReceiving[key] = "no"; }
+        }
+        if(cmp(commandName, "NICK") == 0) {
+            Task<string> sender = spawn IrcSenderRaw(line);
+            string oldNick = sender.take();
+            if(cmp(oldNick, nick) == 0) {
+                Task<string> replacement = spawn IrcTrailingRaw(payload);
+                string newNick = replacement.take();
+                if(len(newNick) == 0) {
+                    newNick.dispose();
+                    Task<string> parameter = spawn StringFieldRaw(payload, " ", 1);
+                    newNick = parameter.take();
+                }
+                if(len(newNick) > 0) {
+                    nick.dispose();
+                    nick = newNick;
+                } else { newNick.dispose(); }
+            }
+            oldNick.dispose();
+        }
+        payload.dispose();
+        commandName.dispose();
+        return true;
+    }
+
+    internal method bool command(string input) {
+        Task<int64> saveProfile = spawn StringStartsWithRaw(input, "profile\t");
+        Task<int64> connectProfile = spawn StringStartsWithRaw(input, "connect\t");
+        int64 saving = saveProfile.take();
+        int64 connecting = connectProfile.take();
+        if(saving != 0 || connecting != 0) {
+            Task<string> fields = spawn StringSliceRaw(input, 8, len(input)-8);
+            string value = fields.take();
+            bool ok = configure(value, connecting != 0);
+            value.dispose();
+            return ok;
+        }
+        if(len(fd) == 0 || len(input) == 0) { return false; }
+        Task<int64> join = spawn StringStartsWithRaw(input, "join ");
+        Task<int64> isMessage = spawn StringStartsWithRaw(input, "msg ");
+        Task<int64> isNick = spawn StringStartsWithRaw(input, "nick ");
+        Task<int64> say = spawn StringStartsWithRaw(input, "say ");
+        int64 wantJoin = join.take();
+        int64 wantMessage = isMessage.take();
+        int64 wantNick = isNick.take();
+        int64 wantSay = say.take();
+        if(wantJoin != 0) {
+            Task<string> target = spawn StringSliceRaw(input, 5, len(input) - 5);
+            string room = target.take();
+            Task<bool> valid = spawn IrcValidTargetRaw(room);
+            Task<bool> isChannel = spawn IrcIsChannelRaw(room);
+            bool allowed = valid.take();
+            bool channelTarget = isChannel.take();
+            if(!allowed || !channelTarget) {
+                room.dispose();
+                return false;
+            }
+            string key = ensureConversation("channels", room);
+            if(len(key) == 0) {
+                room.dispose();
+                key.dispose();
+                return false;
+            }
+            string request = cat("JOIN ", room);
+            Task<bool> sent = spawn IrcSend(fd, request);
+            bool joined = sent.take();
+            request.dispose();
+            if(!joined) {
+                room.dispose();
+                key.dispose();
+                return false;
+            }
+            channel.dispose();
+            activeKey.dispose();
+            channel = room;
+            activeKey = key;
+            showLegacyChannel(key);
+            return true;
+        }
+        if(wantMessage != 0) {
+            Task<string> args = spawn StringSliceRaw(input, 4, len(input) - 4);
+            string argline = args.take();
+            Task<int64> gap = spawn StringIndexOfRaw(argline, " ");
+            int64 pos = gap.take();
+            if(pos <= 0 || pos >= len(argline) - 1) {
+                argline.dispose();
+                return false;
+            }
+            Task<string> target = spawn StringSliceRaw(argline, 0, pos);
+            Task<string> body = spawn StringSliceRaw(argline, pos + 1, len(argline) - pos - 1);
+            string destination = target.take();
+            string words = body.take();
+            argline.dispose();
+            Task<bool> valid = spawn IrcValidTargetRaw(destination);
+            if(!valid.take()) {
+                destination.dispose();
+                words.dispose();
+                return false;
+            }
+            Task<bool> isChannel = spawn IrcIsChannelRaw(destination);
+            string key = "";
+            if(isChannel.take()) { key = ensureConversation("channels", destination); }
+            else { key = ensureConversation("users", destination); }
+            if(len(key) == 0) {
+                destination.dispose();
+                words.dispose();
+                key.dispose();
+                return false;
+            }
+            string prefix = cat("PRIVMSG ", destination);
+            string middle = cat(prefix, " :");
+            string request = cat(middle, words);
+            prefix.dispose();
+            middle.dispose();
+            Task<bool> sent = spawn IrcSend(fd, request);
+            bool delivered = sent.take();
+            request.dispose();
+            if(delivered) { recordChat(key, nick, words); }
+            key.dispose();
+            destination.dispose();
+            words.dispose();
+            return delivered;
+        }
+        if(wantNick != 0) {
+            Task<string> replacement = spawn StringSliceRaw(input, 5, len(input) - 5);
+            string newNick = replacement.take();
+            Task<bool> valid = spawn IrcValidTargetRaw(newNick);
+            if(!valid.take()) {
+                newNick.dispose();
+                return false;
+            }
+            string request = cat("NICK ", newNick);
+            Task<bool> sent = spawn IrcSend(fd, request);
+            bool ok = sent.take();
+            request.dispose();
+            newNick.dispose();
+            return ok;
+        }
+        if(wantSay != 0 && len(channel) > 0) {
+            Task<string> body = spawn StringSliceRaw(input, 4, len(input) - 4);
+            string words = body.take();
+            string prefix = cat("PRIVMSG ", channel);
+            string middle = cat(prefix, " :");
+            string request = cat(middle, words);
+            prefix.dispose();
+            middle.dispose();
+            Task<bool> sent = spawn IrcSend(fd, request);
+            bool delivered = sent.take();
+            request.dispose();
+            if(!delivered) {
+                words.dispose();
+                return false;
+            }
+            recordChat(activeKey, nick, words);
+            words.dispose();
+            return true;
+        }
+        if(cmp(input, "quit") == 0) {
+            Task<bool> sent = spawn IrcSend(fd, "QUIT :leaving");
+            return sent.take();
+        }
+        return false;
+    }
+}
+
+function IrcPump(string fd) int64 {
+    IrcNetwork network = lookup("network");
+    while(true) {
+        Task<string> read = spawn IrcReadLineRaw(fd);
+        string line = read.take();
+        if(len(line) == 0) {
+            line.dispose();
+            network.closed();
+            return 0;
+        }
+        network.incoming(line);
+        line.dispose();
+    }
+}
+
+function IrcStart(string address, string nick, string realName,
+                  string transport, string host, string trustPath) int64 {
+    IrcNetwork network = lookup("network");
+    Task<string> dial;
+    if(cmp(transport, "tls") == 0) {
+        dial = spawn IrcDialTLSRaw(address, host, trustPath);
+    } else {
+        dial = spawn NetDialRaw(address);
+    }
+    string fd = dial.take();
+    Task<int64> failed = spawn StringStartsWithRaw(fd, "error:");
+    if(failed.take() != 0) {
+        Task<string> detail = spawn StringSliceRaw(fd, 6, len(fd)-6);
+        network.connectionError(detail.take());
+        network.closed();
+        return -1;
+    }
+    if(len(fd) == 0) {
+        network.closed();
+        return -1;
+    }
+    network.connected(fd);
+    Task<bool> registrationNick = spawn IrcSend(fd, cat("NICK ", nick));
+    if(!registrationNick.take()) {
+        network.closed();
+        return -1;
+    }
+    string shownName = realName;
+    if(len(shownName) == 0) { shownName = nick; }
+    Task<bool> registrationUser = spawn IrcSend(fd, cat(cat(cat("USER ", nick), " 0 * :"), shownName));
+    if(!registrationUser.take()) {
+        network.closed();
+        return -1;
+    }
+    Task<int64> reader = spawn IrcPump(fd);
+    return 0;
+}
+
+class IrcViews {
+    ViewController;
+    private IrcNetwork network;
+
+    method IrcViews(IrcNetwork model) {
+        network = model;
+    }
+
+    internal method FileTree display(string id, string caller) {
+        FileTree root = new FileTree();
+        root.dir("networks");
+        root.dir("networks/default");
+        root.live("networks/default/input", true);
+        MountTable mounts = new MountTable();
+        mounts.view("networks/default", "o9irc.network.default", 1);
+        root.apply(mounts);
+        mounts.close();
+        return root;
+    }
+
+    internal method string readText(string id, string path) {
+        return "";
+    }
+
+    internal method int64 writeText(string id, string path, int64 offset, string text, bool truncate) {
+        if(cmp(path, "networks/default/input") != 0 || offset != 0) {
+            return -1;
+        }
+        string input = text;
+        bool ownsInput = false;
+        Task<int64> endsNewline = spawn StringEndsWithRaw(input, "\n");
+        if(endsNewline.take() != 0) {
+            Task<string> trimmed = spawn StringSliceRaw(input, 0, len(input) - 1);
+            input = trimmed.take();
+            ownsInput = true;
+        }
+        Task<int64> connects = spawn StringStartsWithRaw(input, "connect\t");
+        bool connectNow = connects.take() != 0;
+        bool accepted = network.command(input);
+        if(accepted && connectNow) {
+            Task<int64> connection = spawn IrcStart(network.connectionAddress(),
+                network.connectionNick(), network.connectionName(),
+                network.connectionTransport(), network.connectionHost(),
+                network.connectionTrustPath());
+        }
+        if(ownsInput) { input.dispose(); }
+        if(accepted) {
+            return len(text);
+        }
+        return -1;
+    }
+}
+
+main {
+    Task<int64> count = spawn ProcessArgcRaw();
+    int64 argTotal = count.take();
+    if(argTotal == 3) {
+        print("usage: ircfs ircfs [tcp!host!6667|tls!host!6697 nick [#channel [historydir [limit [trustedkeys]]]]]\n");
+    } else {
+        string address = "";
+        string nick = "";
+        if(argTotal >= 4) {
+        Task<string> addressArg = spawn ProcessArgRaw(2);
+        Task<string> nickArg = spawn ProcessArgRaw(3);
+            address = addressArg.take();
+            nick = nickArg.take();
+        }
+        string channel = "";
+        if(argTotal > 4) {
+            Task<string> channelArg = spawn ProcessArgRaw(4);
+            channel = channelArg.take();
+        }
+        Task<string> currentUser = spawn ProcessUserRaw();
+        string historyDirectory = cat(cat("/usr/", currentUser.take()), "/lib/o9irc");
+        if(argTotal > 5) {
+            Task<string> dirArg = spawn ProcessArgRaw(5);
+            historyDirectory = dirArg.take();
+        }
+        string limitArg = "";
+        if(argTotal > 6) {
+            Task<string> maxArg = spawn ProcessArgRaw(6);
+            limitArg = maxArg.take();
+        }
+        string transport = "tcp";
+        string serverName = "";
+        string trustFile = "";
+        Task<int64> secureAddress = spawn StringStartsWithRaw(address, "tls!");
+        if(secureAddress.take() != 0) {
+            transport = "tls";
+            Task<string> hostField = spawn StringFieldRaw(address, "!", 1);
+            Task<string> portField = spawn StringFieldRaw(address, "!", 2);
+            serverName = hostField.take();
+            string securePort = portField.take();
+            address = cat(cat(cat("tcp!", serverName), "!"), securePort);
+            if(argTotal > 7) {
+                Task<string> trustArg = spawn ProcessArgRaw(7);
+                trustFile = trustArg.take();
+            }
+        }
+        Task<int64> limit = spawn IrcHistoryLimitRaw(limitArg);
+        IrcNetwork network = new IrcNetwork(channel, nick, address, historyDirectory, limit.take());
+        IrcViews views = new IrcViews(network);
+        viewController(views);
+        if(len(address) > 0) {
+            Task<int64> connection = spawn IrcStart(address, nick, "",
+                transport, serverName, trustFile);
+        }
+        serve();
+    }
+}

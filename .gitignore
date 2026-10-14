@@ -1,0 +1,10 @@
+irc
+/ircfs
+/gui
+/test/mock_view
+/test/ui_input_probe
+irc.c
+irc.[5687qvk]
+*.img
+local/
+__pycache__/

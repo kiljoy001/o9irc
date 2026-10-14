@@ -1,0 +1,183 @@
+// A small terminal IRC client written in o9c.
+import "protocol.o9";
+import "process.o9";
+
+function IrcLine(string fd, string line, string initialChannel) int64 {
+    Task<string> parsed = spawn IrcPayload(line);
+    string rest = parsed.await();
+    if(len(rest) == 0) {
+        return 0;
+    }
+    Task<int64> commandEnd = spawn StringIndexOfRaw(rest, " ");
+    int64 pos = commandEnd.await();
+    string command = rest;
+    string params = "";
+    if(pos >= 0 && pos < len(rest)) {
+        Task<string> name = spawn StringSliceRaw(rest, 0, pos);
+        Task<string> tail = spawn StringSliceRaw(rest, pos + 1, len(rest) - pos - 1);
+        command = name.await();
+        params = tail.await();
+    }
+    if(cmp(command, "PING") == 0) {
+        if(len(params) > 0) {
+            Task<bool> pong = spawn IrcSend(fd, cat("PONG ", params));
+            pong.await();
+        }
+        return 0;
+    }
+    if(cmp(command, "001") == 0 && len(initialChannel) > 0) {
+        Task<bool> join = spawn IrcSend(fd, cat("JOIN ", initialChannel));
+        join.await();
+    }
+    if(cmp(command, "ERROR") == 0) {
+        print("irc: ", line, "\n");
+        return -1;
+    }
+    print(line, "\n");
+    return 0;
+}
+
+function IrcReceive(string fd, string initialChannel, string initialNick) int64 {
+    string pending = "";
+    int64 nickFallbacks = 0;
+    bool registered = false;
+    byte crbyte = 13;
+    Task<string> crtext = spawn BytesAppendRaw("", crbyte);
+    string crchar = crtext.await();
+    while(true) {
+        Task<string> incoming = spawn NetReadRaw(fd, 2048);
+        string chunk = incoming.await();
+        if(len(chunk) == 0) {
+            print("irc: connection closed\n");
+            return 0;
+        }
+        pending = cat(pending, chunk);
+        Task<int64> newline = spawn StringIndexOfRaw(pending, "\n");
+        int64 pos = newline.await();
+        while(pos >= 0 && pos < len(pending)) {
+            Task<string> head = spawn StringSliceRaw(pending, 0, pos);
+            Task<string> tail = spawn StringSliceRaw(pending, pos + 1, len(pending) - pos - 1);
+            string line = head.await();
+            pending = tail.await();
+            Task<int64> cr = spawn StringEndsWithRaw(line, crchar);
+            if(cr.await() != 0) {
+                Task<string> trimmed = spawn StringSliceRaw(line, 0, len(line) - 1);
+                line = trimmed.await();
+            }
+            if(len(line) > 0) {
+                Task<string> parsed = spawn IrcPayload(line);
+                string payload = parsed.take();
+                Task<string> commandField = spawn StringFieldRaw(payload, " ", 0);
+                string command = commandField.take();
+                if(cmp(command, "001") == 0) { registered = true; }
+                if(cmp(command, "433") == 0 && !registered) {
+                    if(nickFallbacks < 9) {
+                        nickFallbacks = nickFallbacks + 1;
+                        Task<string> candidate = spawn IrcNickFallbackRaw(initialNick, nickFallbacks);
+                        string nextNick = candidate.take();
+                        string request = cat("NICK ", nextNick);
+                        Task<bool> sent = spawn IrcSend(fd, request);
+                        if(sent.take()) {
+                            print("irc: nickname in use; trying ", nextNick, "\n");
+                        }
+                        request.dispose();
+                        nextNick.dispose();
+                    } else {
+                        print("irc: fallback nicknames exhausted; use /nick name\n");
+                    }
+                }
+                command.dispose();
+                payload.dispose();
+                Task<int64> handled = spawn IrcLine(fd, line, initialChannel);
+                if(handled.await() < 0) {
+                    return -1;
+                }
+            }
+            Task<int64> next = spawn StringIndexOfRaw(pending, "\n");
+            pos = next.await();
+        }
+        if(len(pending) > 8192) {
+            print("irc: server line too long\n");
+            return -1;
+        }
+    }
+}
+
+main {
+    Task<int64> count = spawn ProcessArgcRaw();
+    if(count.await() < 4) {
+        print("usage: irc irc tcp!server!6667 nick [#channel]\n");
+    } else {
+        Task<string> addressArg = spawn ProcessArgRaw(2);
+        Task<string> nickArg = spawn ProcessArgRaw(3);
+        string address = addressArg.await();
+        string nick = nickArg.await();
+        string channel = "";
+        Task<int64> countAgain = spawn ProcessArgcRaw();
+        if(countAgain.await() > 4) {
+            Task<string> channelArg = spawn ProcessArgRaw(4);
+            channel = channelArg.await();
+        }
+        Task<string> dial = spawn NetDialRaw(address);
+        string fd = dial.await();
+        if(len(fd) == 0) {
+            print("irc: cannot dial ", address, "\n");
+        } else {
+            Task<bool> registrationNick = spawn IrcSend(fd, cat("NICK ", nick));
+            registrationNick.await();
+            Task<bool> registrationUser = spawn IrcSend(fd, cat(cat(cat("USER ", nick), " 0 * :"), nick));
+            registrationUser.await();
+            Task<int64> reader = spawn IrcReceive(fd, channel, nick);
+            print("irc: connected; /join, /msg, /nick, /quit; plain text sends to ", channel, "\n");
+            bool done = false;
+            while(!done) {
+                string input = readline();
+                if(len(input) == 0) {
+                    done = true;
+                } else {
+                    Task<int64> quit = spawn StringStartsWithRaw(input, "/quit");
+                    Task<int64> join = spawn StringStartsWithRaw(input, "/join ");
+                    Task<int64> msg = spawn StringStartsWithRaw(input, "/msg ");
+                    Task<int64> newNick = spawn StringStartsWithRaw(input, "/nick ");
+                    if(quit.await() != 0) {
+                        Task<bool> goodbye = spawn IrcSend(fd, "QUIT :leaving");
+                        goodbye.await();
+                        done = true;
+                    } else if(join.await() != 0) {
+                        Task<string> target = spawn StringSliceRaw(input, 6, len(input) - 6);
+                        channel = target.await();
+                        Task<bool> joined = spawn IrcSend(fd, cat("JOIN ", channel));
+                        joined.await();
+                    } else if(msg.await() != 0) {
+                        Task<string> args = spawn StringSliceRaw(input, 5, len(input) - 5);
+                        string argline = args.await();
+                        Task<int64> gap = spawn StringIndexOfRaw(argline, " ");
+                        int64 pos = gap.await();
+                        if(pos > 0 && pos < len(argline) - 1) {
+                            Task<string> target = spawn StringSliceRaw(argline, 0, pos);
+                            Task<string> body = spawn StringSliceRaw(argline, pos + 1, len(argline) - pos - 1);
+                            Task<bool> privateMessage = spawn IrcSend(fd, cat(cat(cat("PRIVMSG ", target.await()), " :"), body.await()));
+                            privateMessage.await();
+                        } else {
+                            print("usage: /msg target text\n");
+                        }
+                    } else if(newNick.await() != 0) {
+                        Task<string> replacement = spawn StringSliceRaw(input, 6, len(input) - 6);
+                        nick = replacement.await();
+                        Task<bool> changedNick = spawn IrcSend(fd, cat("NICK ", nick));
+                        changedNick.await();
+                    } else if(cmp(input, "/help") == 0) {
+                        print("/join #channel; /msg target text; /nick name; /quit\n");
+                    } else if(len(channel) == 0) {
+                        print("irc: join a channel or use /msg target text\n");
+                    } else {
+                        Task<bool> channelMessage = spawn IrcSend(fd, cat(cat(cat("PRIVMSG ", channel), " :"), input));
+                        channelMessage.await();
+                    }
+                }
+            }
+            Task<int64> close = spawn NetCloseRaw(fd);
+            close.await();
+        }
+    }
+}

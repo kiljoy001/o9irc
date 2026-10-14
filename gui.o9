@@ -1,0 +1,1542 @@
+// Rio GUI for the o9irc 9P view. It never opens an IRC socket.
+import "draw.o9";
+import "process.o9";
+import "string.o9";
+import "uiio.o9";
+
+// A timer wakes event() so the 9P view can be refreshed between mouse events.
+function IrcUiStartTimerRaw() int64 {
+    use { event }
+    int64 out;
+    c {
+        out = etimer(0, 100);
+    }
+    return out;
+}
+
+// The index is key<TAB>display-name<NL>. Selection belongs to this GUI;
+// neither the IRC actor nor another attached GUI changes it.
+function IrcUiIndexFieldRaw(string index, int64 row, bool name) string {
+    string out;
+    c {
+        char *p, *end, *tab, *nl;
+        vlong i, n;
+
+        out = o9_string_from_c("");
+        p = o9_string_data(index);
+        end = p + o9_string_len(index);
+        for(i = 0; i <= row && p < end; i++){
+            nl = memchr(p, '\n', end-p);
+            if(nl == nil)
+                nl = end;
+            if(i == row){
+                tab = memchr(p, '\t', nl-p);
+                if(tab != nil){
+                    if(name){
+                        p = tab+1;
+                        n = nl-p;
+                    }else
+                        n = tab-p;
+                    o9_string_release(out);
+                    out = o9_string_new(p, n);
+                }
+            }
+            p = nl+1;
+        }
+    }
+    return out;
+}
+
+// Keep the identity distinct from the controls without changing Rio's
+// familiar text and menu behavior. Fall back to the active font if needed.
+function IrcUiTitleRaw(int64 canvas, string label, int64 x, int64 y) int64 {
+    use { draw }
+    int64 out;
+    c {
+        static Font *heading;
+        Image *ink;
+        char *text;
+
+        out = 0;
+        if(canvas > 0 && display != nil && screen != nil){
+            if(heading == nil)
+                heading = openfont(display,
+                    "/lib/font/bit/lucidasans/boldunicode.13.font");
+            ink = allocimage(display, Rect(0, 0, 1, 1), screen->chan, 1,
+                0xffffffff);
+            text = o9_string_cstr(label);
+            if(ink != nil && text != nil){
+                string(screen, Pt(screen->r.min.x+x, screen->r.min.y+y),
+                    ink, ZP, heading != nil ? heading : font, text);
+                out = 1;
+            }
+            free(text);
+            if(ink != nil)
+                freeimage(ink);
+        }
+    }
+    return out;
+}
+
+function IrcUiFieldEditRaw(string value, int64 key, int64 maximum) string {
+    string out;
+    c {
+        char *p;
+        vlong n;
+
+        p = o9_string_data(value);
+        n = o9_string_len(value);
+        out = o9_string_new(p, n);
+        if((key == 8 || key == 127) && n > 0){
+            o9_string_release(out);
+            out = o9_string_new(p, n-1);
+        }else if(key >= 32 && key <= 126 && n < maximum){
+            char buf[256];
+            if(n < sizeof buf-1){
+                memmove(buf, p, n);
+                buf[n] = key;
+                o9_string_release(out);
+                out = o9_string_new(buf, n+1);
+            }
+        }
+    }
+    return out;
+}
+
+function IrcUiClippedTextRaw(int64 canvas, string value, int64 x, int64 y,
+                             int64 width, int64 color) int64 {
+    use { draw }
+    int64 out;
+    c {
+        char *text;
+        Image *ink;
+        Rectangle oldclip, clip;
+        vlong n, start;
+
+        out = 0;
+        if(canvas > 0 && display != nil && screen != nil && font != nil && width > 0){
+            text = o9_string_cstr(value);
+            if(text != nil){
+                n = strlen(text);
+                start = 0;
+                while(start < n && stringwidth(font, text+start) > width-8)
+                    start++;
+                ink = allocimage(display, Rect(0, 0, 1, 1), screen->chan, 1,
+                    ((ulong)color << 8) | 0xff);
+                oldclip = screen->clipr;
+                clip = Rect(screen->r.min.x+x, screen->r.min.y+y,
+                    screen->r.min.x+x+width, screen->r.min.y+y+font->height);
+                if(ink != nil && rectclip(&clip, oldclip)){
+                    replclipr(screen, 0, clip);
+                    string(screen, Pt(screen->r.min.x+x, screen->r.min.y+y),
+                        ink, ZP, font, text+start);
+                    replclipr(screen, 0, oldclip);
+                    out = 1;
+                }
+                if(ink != nil) freeimage(ink);
+                free(text);
+            }
+        }
+    }
+    return out;
+}
+
+function IrcUiProfileCommandRaw(bool connectNow, string host, string port,
+                                string nick, string channel, string realName,
+                                bool tls, string trustPath) string {
+    string out;
+    c {
+        char buf[900];
+        int n;
+
+        n = snprint(buf, sizeof buf, "%s\t%.*s\t%.*s\t%.*s\t%.*s\t%.*s\t%s\t%.*s\n",
+            connectNow ? "connect" : "profile",
+            (int)o9_string_len(host), o9_string_data(host),
+            (int)o9_string_len(port), o9_string_data(port),
+            (int)o9_string_len(nick), o9_string_data(nick),
+            (int)o9_string_len(channel), o9_string_data(channel),
+            (int)o9_string_len(realName), o9_string_data(realName),
+            tls ? "tls" : "tcp",
+            (int)o9_string_len(trustPath), o9_string_data(trustPath));
+        out = n < sizeof buf-1 ? o9_string_new(buf, n) : o9_string_from_c("");
+    }
+    return out;
+}
+
+function IrcUiDrawConversationTreeRaw(int64 canvas, string index, string selected,
+                                      int64 height) int64 {
+    use { draw }
+    int64 out;
+    c {
+        char *p, *end, *nl, *tab, *name, *prefix;
+        char label[128];
+        Image *ink, *highlight;
+        Rectangle clip, oldclip;
+        Rune rune;
+        int row, y, n, namelen, step, abbreviated, prefixwidth, maxwidth;
+
+        out = 0;
+        if(canvas > 0 && display != nil && screen != nil && font != nil){
+            ink = allocimage(display, Rect(0, 0, 1, 1), screen->chan, 1, 0x243950ff);
+            highlight = allocimage(display, Rect(0, 0, 1, 1), screen->chan, 1, 0xd5e7faff);
+            p = o9_string_data(index);
+            end = p + o9_string_len(index);
+            row = 0;
+            while(p < end && row < 64){
+                y = 159 + row*22;
+                if(y > height - 68)
+                    break;
+                nl = memchr(p, '\n', end-p);
+                if(nl == nil)
+                    nl = end;
+                tab = memchr(p, '\t', nl-p);
+                if(tab != nil){
+                    if(highlight != nil && o9_string_len(selected) == tab-p &&
+                       memcmp(p, o9_string_data(selected), tab-p) == 0)
+                        draw(screen, Rect(screen->r.min.x+26, screen->r.min.y+y-3,
+                            screen->r.min.x+164, screen->r.min.y+y+19), highlight, nil, ZP);
+                    name = tab+1;
+                    namelen = nl-name;
+                    prefix = tab-p >= 6 && memcmp(p, "users/", 6) == 0 ? "@" : "";
+                    prefixwidth = stringwidth(font, prefix);
+                    maxwidth = 164-34-4;
+                    n = 0;
+                    while(n < namelen){
+                        step = chartorune(&rune, name+n);
+                        if(step < 1 || n+step > namelen ||
+                           n+step >= sizeof label-4 ||
+                           prefixwidth+stringnwidth(font, name, n+step) > maxwidth)
+                            break;
+                        n += step;
+                    }
+                    abbreviated = n < namelen;
+                    if(abbreviated)
+                        while(n > 0 && prefixwidth+stringnwidth(font, name, n)+
+                              stringwidth(font, "...") > maxwidth){
+                            n--;
+                            while(n > 0 && ((uchar)name[n] & 0xc0) == 0x80)
+                                n--;
+                        }
+                    snprint(label, sizeof label, "%s%.*s%s", prefix, n, name,
+                        abbreviated ? "..." : "");
+                    if(ink != nil){
+                        oldclip = screen->clipr;
+                        clip = Rect(screen->r.min.x+34, screen->r.min.y+y,
+                            screen->r.min.x+164, screen->r.min.y+y+font->height);
+                        if(rectclip(&clip, oldclip)){
+                            replclipr(screen, 0, clip);
+                            string(screen, Pt(screen->r.min.x+34, screen->r.min.y+y),
+                                ink, ZP, font, label);
+                            replclipr(screen, 0, oldclip);
+                        }
+                    }
+                }
+                p = nl+1;
+                row++;
+            }
+            if(ink != nil)
+                freeimage(ink);
+            if(highlight != nil)
+                freeimage(highlight);
+            out = row;
+        }
+    }
+    return out;
+}
+
+function IrcUiPanel(int64 canvas, int64 x, int64 y, int64 width, int64 height, int64 color) int64 {
+    Task<int64> fill = spawn DrawCanvasFillRectRaw(canvas, x, y, width, height, color);
+    fill.await();
+    Task<int64> edge = spawn DrawCanvasBorderRectRaw(canvas, x, y, width, height, 1, 0xb7c4d2);
+    int64 result = edge.await();
+    c { o9_task_close(fill); o9_task_close(edge); }
+    return result;
+}
+
+// One layout pass supplies painting, selection, hit testing, and scrollback.
+// Rows are byte ranges in the original 9P text; wrapping never changes what
+// copying to /dev/snarf returns.
+function IrcUiChatRaw(int64 canvas, string value, int64 width, int64 height,
+                      int64 back, int64 anchor, int64 cursor,
+                      int64 x, int64 y, int64 mode) int64 {
+    use { draw }
+    int64 out;
+    c {
+        char *text, *nl;
+        Image *ink;
+        Rune r;
+        vlong length, pos, lineend, start, end, space, count, first, target;
+        vlong lo, hi, a, b, offset;
+        int pass, rows, limit, used, n, rw, row, px, x1, x2, yy;
+
+        out = 0;
+        text = o9_string_data(value);
+        length = o9_string_len(value);
+        if(text != nil && length > 0 && font != nil && width > 16){
+            rows = (height - 12) / 18;
+            if(rows < 1)
+                rows = 1;
+            limit = width - 16;
+            ink = nil;
+            if(mode == 1 && canvas > 0 && display != nil && screen != nil &&
+               anchor >= 0 && cursor >= 0 && anchor != cursor)
+                ink = allocimage(display, Rect(0, 0, 1, 1), screen->chan, 1, 0xbad7ffff);
+            if(mode == 2 && canvas > 0 && display != nil && screen != nil)
+                ink = allocimage(display, Rect(0, 0, 1, 1), screen->chan, 1, 0x172536ff);
+            lo = anchor < cursor ? anchor : cursor;
+            hi = anchor > cursor ? anchor : cursor;
+            count = 0;
+            first = 0;
+            target = 0;
+            for(pass = 0; pass < (mode == 0 ? 1 : 2); pass++){
+                if(pass == 1){
+                    first = count > rows ? count - rows - back : 0;
+                    if(first < 0)
+                        first = 0;
+                    row = (y - 118) / 18;
+                    if(y < 118)
+                        row = 0;
+                    if(row >= rows)
+                        row = rows - 1;
+                    target = first + row;
+                    if(target >= count)
+                        target = count - 1;
+                    count = 0;
+                }
+                pos = 0;
+                while(pos < length){
+                    nl = memchr(text + pos, '\n', length - pos);
+                    lineend = nl != nil ? nl - text : length;
+                    start = pos;
+                    do{
+                        end = start;
+                        space = -1;
+                        used = 0;
+                        while(end < lineend){
+                            n = chartorune(&r, text + end);
+                            if(n < 1 || n > lineend - end){
+                                n = 1;
+                                r = Runeerror;
+                            }
+                            rw = runestringnwidth(font, &r, 1);
+                            if(used + rw > limit && end > start)
+                                break;
+                            used += rw;
+                            end += n;
+                            if(r == ' ' || r == '\t')
+                                space = end;
+                            if(used > limit)
+                                break;
+                        }
+                        if(end < lineend && space > start)
+                            end = space;
+                        if(pass == 1 && count >= first && count < first + rows){
+                            yy = 118 + (count - first) * 18;
+                            if(mode == 1 && ink != nil){
+                                a = lo > start ? lo : start;
+                                b = hi < end ? hi : end;
+                                if(a < start)
+                                    a = start;
+                                if(a > end)
+                                    a = end;
+                                if(b > end)
+                                    b = end;
+                                if(b > a || (nl != nil && end == lineend &&
+                                   hi > lineend && lo <= lineend)){
+                                    x1 = 188 + stringnwidth(font, text + start, a - start);
+                                    x2 = 188 + stringnwidth(font, text + start, b - start);
+                                    if(nl != nil && end == lineend && hi > lineend)
+                                        x2 += 5;
+                                    if(x2 <= x1)
+                                        x2 = x1 + 5;
+                                    if(x1 > 180 + width - 8)
+                                        x1 = 180 + width - 8;
+                                    if(x2 > 180 + width - 8)
+                                        x2 = 180 + width - 8;
+                                    if(x2 > x1)
+                                        draw(screen, Rect(screen->r.min.x+x1,
+                                            screen->r.min.y+yy, screen->r.min.x+x2,
+                                            screen->r.min.y+yy+16), ink, nil, ZP);
+                                }
+                            }else if(mode == 2 && ink != nil){
+                                stringn(screen, Pt(screen->r.min.x+188,
+                                    screen->r.min.y+yy), ink, ZP, font,
+                                    text + start, end - start);
+                            }else if(mode == 3 && count == target){
+                                px = 0;
+                                offset = start;
+                                while(offset < end){
+                                    n = chartorune(&r, text + offset);
+                                    if(n < 1 || n > end - offset){
+                                        n = 1;
+                                        r = Runeerror;
+                                    }
+                                    rw = runestringnwidth(font, &r, 1);
+                                    if(x - 188 < px + rw / 2)
+                                        break;
+                                    px += rw;
+                                    offset += n;
+                                }
+                                out = offset;
+                            }
+                        }
+                        count++;
+                        start = end;
+                    }while(start < lineend);
+                    pos = nl != nil ? lineend + 1 : length;
+                }
+            }
+            if(mode == 0)
+                out = count;
+            if(ink != nil)
+                freeimage(ink);
+        }
+    }
+    return out;
+}
+
+function IrcUiLines(int64 canvas, string value, int64 x, int64 y, int64 width, int64 height,
+                    bool tail, int64 back) int64 {
+    Task<int64> counted = spawn StringCountRaw(value, "\n");
+    int64 count = counted.await();
+    Task<int64> ended = spawn StringEndsWithRaw(value, "\n");
+    if(len(value) > 0 && ended.await() == 0) { count = count + 1; }
+    int64 rows = (height - 12) / 18;
+    if(rows < 1) { rows = 1; }
+    int64 first = 0;
+    if(tail && count > rows) {
+        first = count - rows - back;
+        if(first < 0) { first = 0; }
+    }
+    int64 last = count;
+    if(last > first + rows) { last = first + rows; }
+    int64 maxChars = (width - 16) / 8;
+    if(maxChars < 1) { maxChars = 1; }
+    int64 i = first;
+    while(i < last) {
+        Task<string> field = spawn StringFieldRaw(value, "\n", i);
+        string line = field.await();
+        if(len(line) > maxChars) {
+            Task<string> clipped = spawn StringSliceRaw(line, 0, maxChars);
+            string shorter = clipped.await();
+            c { o9_string_release(line); o9_task_close(clipped); }
+            line = shorter;
+        }
+        Task<int64> drawn = spawn DrawCanvasTextRaw(canvas, line, x + 8, y + 6 + (i - first) * 18, 0x172536);
+        drawn.await();
+        c { o9_string_release(line); o9_task_close(field); o9_task_close(drawn); }
+        i = i + 1;
+    }
+    c { o9_task_close(counted); o9_task_close(ended); }
+    return count;
+}
+
+function IrcUiMaxBack(string value, int64 width, int64 height) int64 {
+    Task<int64> counted = spawn IrcUiChatRaw(0, value, width - 340, height - 184,
+                                              0, -1, -1, 0, 0, 0);
+    int64 count = counted.await();
+    int64 rows = (height - 196) / 18;
+    if(rows < 1) { rows = 1; }
+    c { o9_task_close(counted); }
+    if(count > rows) { return count - rows; }
+    return 0;
+}
+
+// Map a mouse position in the chat pane to a byte boundary in the plain-text
+// 9P transcript. The same layout routine paints the text and selection.
+function IrcUiHitChatRaw(string value, int64 width, int64 height, int64 back,
+                         int64 x, int64 y) int64 {
+    Task<int64> hit = spawn IrcUiChatRaw(0, value, width, height, back,
+                                         -1, -1, x, y, 3);
+    int64 result = hit.await();
+    c { o9_task_close(hit); }
+    return result;
+}
+
+function IrcUiHighlightRaw(int64 canvas, string value, int64 width, int64 height,
+                           int64 back, int64 anchor, int64 cursor) int64 {
+    Task<int64> mark = spawn IrcUiChatRaw(canvas, value, width, height, back,
+                                          anchor, cursor, 0, 0, 1);
+    int64 result = mark.await();
+    c { o9_task_close(mark); }
+    return result;
+}
+
+// Move a long label by complete UTF-8 runes and pause at both ends.
+function IrcUiScrollLabelRaw(int64 canvas, string value, int64 x, int64 y,
+                             int64 width, int64 tick, int64 color) int64 {
+    use { draw }
+    int64 out;
+    c {
+        char *text;
+        Image *ink;
+        Rune r;
+        vlong length, offset, end, start, maxstart, phase, cycle, i;
+        int n, total, prefix, used, rw;
+
+        out = 0;
+        text = o9_string_data(value);
+        length = o9_string_len(value);
+        if(canvas > 0 && text != nil && length > 0 && width > 0 &&
+           display != nil && screen != nil && font != nil){
+            total = stringnwidth(font, text, length);
+            start = 0;
+            if(total > width){
+                out = 1;
+                maxstart = 0;
+                prefix = 0;
+                offset = 0;
+                while(offset < length && total - prefix > width){
+                    n = chartorune(&r, text + offset);
+                    if(n < 1 || n > length - offset){
+                        n = 1;
+                        r = Runeerror;
+                    }
+                    prefix += runestringnwidth(font, &r, 1);
+                    offset += n;
+                    maxstart++;
+                }
+                cycle = 2 * maxstart + 8;
+                phase = tick % cycle;
+                if(phase < 4)
+                    start = 0;
+                else if(phase < 4 + maxstart)
+                    start = phase - 3;
+                else if(phase < 8 + maxstart)
+                    start = maxstart;
+                else
+                    start = 2 * maxstart + 7 - phase;
+            }
+            offset = 0;
+            for(i = 0; i < start && offset < length; i++){
+                n = chartorune(&r, text + offset);
+                if(n < 1 || n > length - offset)
+                    n = 1;
+                offset += n;
+            }
+            end = offset;
+            used = 0;
+            while(end < length){
+                n = chartorune(&r, text + end);
+                if(n < 1 || n > length - end){
+                    n = 1;
+                    r = Runeerror;
+                }
+                rw = runestringnwidth(font, &r, 1);
+                if(used + rw > width)
+                    break;
+                used += rw;
+                end += n;
+            }
+            ink = allocimage(display, Rect(0, 0, 1, 1), screen->chan, 1,
+                (color << 8) | 0xff);
+            if(ink != nil){
+                stringn(screen, Pt(screen->r.min.x+x, screen->r.min.y+y),
+                    ink, ZP, font, text + offset, end - offset);
+                freeimage(ink);
+            }
+        }
+    }
+    return out;
+}
+
+function IrcUiCopySelectionRaw(string value, int64 anchor, int64 cursor) int64 {
+    int64 out;
+    c {
+        char *text;
+        vlong lo, hi, pos, length;
+        int fd, n, chunk;
+
+        out = 0;
+        text = o9_string_data(value);
+        length = o9_string_len(value);
+        lo = anchor < cursor ? anchor : cursor;
+        hi = anchor > cursor ? anchor : cursor;
+        if(text != nil && lo >= 0 && hi > lo && hi <= length){
+            fd = open("/dev/snarf", OWRITE|OTRUNC);
+            if(fd >= 0){
+                pos = lo;
+                while(pos < hi){
+                    chunk = hi - pos;
+                    if(chunk > 8192)
+                        chunk = 8192;
+                    n = write(fd, text + pos, chunk);
+                    if(n <= 0)
+                        break;
+                    pos += n;
+                }
+                out = pos == hi;
+                close(fd);
+            }
+        }
+    }
+    return out;
+}
+
+// The timer only moves two labels. Redrawing the whole transcript on each
+// animation step creates unnecessary libdraw traffic and short-lived actors.
+function IrcUiPaintLabels(int64 canvas, int64 width, string channel,
+                          string topic, bool statusView, int64 scrollBack,
+                          int64 labelTick) int64 {
+    int64 chatWidth = width - 340;
+    int64 tabColor = 0xffffff;
+    if(statusView) { tabColor = 0xe3ebf4; }
+    Task<int64> tab = spawn DrawCanvasFillRectRaw(canvas, 104, 42, 82, 24, tabColor);
+    tab.await();
+    Task<string> roomTask = spawn StringTrimRaw(channel);
+    string room = roomTask.await();
+    Task<int64> roomTaskDraw = spawn IrcUiScrollLabelRaw(canvas, room, 112, 46,
+                                                          66, labelTick, 0x173a64);
+    int64 roomScrolling = roomTaskDraw.await();
+
+    Task<int64> bar = spawn DrawCanvasFillRectRaw(canvas, 182, 78,
+                                                  chatWidth - 4, 26, 0xf2f6fa);
+    bar.await();
+    Task<string> topicTask = spawn StringTrimRaw(topic);
+    string trimmedTopic = topicTask.await();
+    string heading = cat("Topic: ", trimmedTopic);
+    if(statusView) {
+        c { o9_string_release(heading); }
+        heading = "Network status and server replies";
+    }
+    if(scrollBack > 0) {
+        string marked = cat(heading, "  [history]");
+        c { o9_string_release(heading); }
+        heading = marked;
+    }
+    Task<int64> topicTaskDraw = spawn IrcUiScrollLabelRaw(canvas, heading, 188, 83,
+                                                           chatWidth - 16, labelTick,
+                                                           0x20344f);
+    int64 topicScrolling = topicTaskDraw.await();
+    Task<int64> flushed = spawn DrawCanvasFlushRaw(canvas);
+    flushed.await();
+    c {
+        o9_task_close(tab);
+        o9_task_close(roomTask);
+        o9_task_close(roomTaskDraw);
+        o9_task_close(bar);
+        o9_task_close(topicTask);
+        o9_task_close(topicTaskDraw);
+        o9_task_close(flushed);
+        o9_string_release(room);
+        o9_string_release(trimmedTopic);
+        o9_string_release(heading);
+    }
+    if(roomScrolling != 0 || topicScrolling != 0) { return 1; }
+    return 0;
+}
+
+function IrcUiPaintInput(int64 canvas, int64 width, int64 height, string input, bool flushNow) int64 {
+    Task<int64> edit = spawn IrcUiPanel(canvas, 180, height - 64, width - 186, 32, 0xffffff);
+    edit.await();
+    string shownInput = cat(input, "|");
+    int64 inputMax = (width - 204) / 8;
+    if(len(shownInput) > inputMax) {
+        Task<string> tailInput = spawn StringSliceRaw(shownInput, len(shownInput) - inputMax, inputMax);
+        string shorter = tailInput.await();
+        c { o9_string_release(shownInput); o9_task_close(tailInput); }
+        shownInput = shorter;
+    }
+    Task<int64> inputText = spawn DrawCanvasTextRaw(canvas, shownInput, 188, height - 57, 0x172536);
+    inputText.await();
+    c { o9_task_close(edit); o9_task_close(inputText); o9_string_release(shownInput); }
+    if(flushNow) {
+        Task<int64> flush = spawn DrawCanvasFlushRaw(canvas);
+        int64 result = flush.await();
+        c { o9_task_close(flush); }
+        return result;
+    }
+    return 1;
+}
+
+function IrcUiSetupRow(int64 canvas, int64 x, int64 y, int64 width,
+                       string label, string value, bool focused) int64 {
+    int64 background = 0xffffff;
+    if(focused) { background = 0xe7f3ff; }
+    Task<int64> box = spawn IrcUiPanel(canvas, x, y, width, 38, background);
+    box.take();
+    Task<int64> title = spawn DrawCanvasTextRaw(canvas, label, x+10, y+10, 0x203149);
+    title.take();
+    Task<int64> content = spawn IrcUiClippedTextRaw(canvas, value, x+145, y+10,
+        width-158, 0x162b45);
+    content.take();
+    return 1;
+}
+
+function IrcUiPaintSetup(int64 canvas, int64 width, int64 height,
+                         string host, string port, string nick, string channel,
+                         string realName, bool tls, string trustPath,
+                         int64 focus, string error) int64 {
+    int64 x = (width-580)/2;
+    int64 y = (height-492)/2;
+    Task<int64> panel = spawn IrcUiPanel(canvas, x, y, 580, 492, 0xf7f9fc);
+    panel.take();
+    Task<int64> heading = spawn DrawCanvasFillRectRaw(canvas, x+1, y+1, 578, 48, 0x203149);
+    heading.take();
+    Task<int64> title = spawn IrcUiTitleRaw(canvas, "Connection setup", x+16, y+11);
+    title.take();
+    Task<int64> hint = spawn DrawCanvasTextRaw(canvas,
+        "Nick and full name are visible to others.",
+        x+16, y+55, 0x465e78);
+    hint.take();
+    Task<int64> serverRow = spawn IrcUiSetupRow(canvas, x+16, y+81, 548,
+        "Server", host, focus == 0);
+    serverRow.take();
+    Task<int64> portRow = spawn IrcUiSetupRow(canvas, x+16, y+128, 548,
+        "Port", port, focus == 1);
+    portRow.take();
+    Task<int64> nickRow = spawn IrcUiSetupRow(canvas, x+16, y+175, 548,
+        "Nickname", nick, focus == 2);
+    nickRow.take();
+    Task<int64> channelRow = spawn IrcUiSetupRow(canvas, x+16, y+222, 548,
+        "Join channel", channel, focus == 3);
+    channelRow.take();
+    Task<int64> nameRow = spawn IrcUiSetupRow(canvas, x+16, y+269, 548,
+        "Full name", realName, focus == 4);
+    nameRow.take();
+    int64 tlsBackground = 0xffffff;
+    if(focus == 5) { tlsBackground = 0xe7f3ff; }
+    Task<int64> tlsBox = spawn IrcUiPanel(canvas, x+16, y+318, 548, 34,
+        tlsBackground);
+    tlsBox.take();
+    string tlsLabel = "[ ] Use TLS (verified server certificate)";
+    if(tls) { tlsLabel = "[X] Use TLS (verified server certificate)"; }
+    Task<int64> tlsText = spawn DrawCanvasTextRaw(canvas, tlsLabel,
+        x+26, y+325, 0x203149);
+    tlsText.take();
+    Task<int64> trustRow = spawn IrcUiSetupRow(canvas, x+16, y+360, 548,
+        "Trusted keys", trustPath, focus == 6);
+    trustRow.take();
+    Task<int64> feedback = spawn IrcUiClippedTextRaw(canvas, error,
+        x+18, y+407, 540, 0xa22e35);
+    feedback.take();
+    Task<int64> saveButton = spawn IrcUiPanel(canvas, x+16, y+438, 160, 42, 0xe3ebf4);
+    saveButton.take();
+    Task<int64> saveText = spawn DrawCanvasTextRaw(canvas, "Save", x+70, y+449, 0x203149);
+    saveText.take();
+    Task<int64> connectButton = spawn IrcUiPanel(canvas, x+190, y+438, 180, 42, 0xd5e7fa);
+    connectButton.take();
+    Task<int64> connectText = spawn DrawCanvasTextRaw(canvas, "Connect", x+242, y+449, 0x203149);
+    connectText.take();
+    Task<int64> cancelButton = spawn IrcUiPanel(canvas, x+384, y+438, 180, 42, 0xe3ebf4);
+    cancelButton.take();
+    Task<int64> cancelText = spawn DrawCanvasTextRaw(canvas, "Cancel", x+436, y+449, 0x203149);
+    cancelText.take();
+    Task<int64> flushed = spawn DrawCanvasFlushRaw(canvas);
+    return flushed.take();
+}
+
+function IrcUiPaint(int64 canvas, int64 width, int64 height, string connection,
+                    string channel, string topic, string transcript, string statuslog,
+                    string nicks, string input, string conversations, string selectedKey,
+                    bool statusView, int64 scrollBack, int64 labelTick,
+                    int64 selectionStart, int64 selectionEnd, bool flushNow) int64 {
+    int64 chatWidth = width - 340;
+    int64 chatHeight = height - 184;
+    int64 nickX = width - 154;
+    Task<int64> op = spawn DrawCanvasClearRaw(canvas, 0xe9eef3);
+    op.await();
+    Task<int64> toolbar = spawn IrcUiPanel(canvas, 6, 6, width - 12, 28, 0x203149);
+    toolbar.await();
+    Task<int64> title = spawn IrcUiTitleRaw(canvas, "o9irc", 15, 7);
+    title.await();
+    Task<int64> menuSurface = spawn DrawCanvasFillRectRaw(canvas, 94, 10, 166, 20, 0x3a5c83);
+    menuSurface.await();
+    Task<int64> menuLabel = spawn DrawCanvasTextRaw(canvas, "Menu  (button 3)", 104, 11, 0xffffff);
+    menuLabel.await();
+    Task<int64> tools = spawn DrawCanvasTextRaw(canvas,
+        "Drag to select   Button 2 copies   Wheel / PgUp / PgDn for history",
+        278, 11, 0xe4edf7);
+    tools.await();
+    Task<int64> switchbar = spawn IrcUiPanel(canvas, 6, 40, width - 12, 28, 0xe3ebf4);
+    switchbar.await();
+    int64 tabX = 104;
+    if(statusView) { tabX = 10; }
+    Task<int64> tabMark = spawn DrawCanvasFillRectRaw(canvas, tabX, 42, 82, 24, 0xffffff);
+    tabMark.await();
+    Task<string> trimRoom = spawn StringTrimRaw(channel);
+    string room = trimRoom.await();
+    Task<int64> tabs = spawn DrawCanvasTextRaw(canvas, "Status", 16, 46, 0x173a64);
+    tabs.await();
+    Task<int64> roomLabel = spawn IrcUiScrollLabelRaw(canvas, room, 112, 46, 66,
+                                                       labelTick, 0x173a64);
+    int64 roomScrolling = roomLabel.await();
+
+    Task<int64> tree = spawn IrcUiPanel(canvas, 6, 76, 166, height - 110, 0xf7f9fc);
+    tree.await();
+    Task<int64> network = spawn DrawCanvasTextRaw(canvas, "Network", 16, 86, 0x243950);
+    network.await();
+    int64 statusColor = 0xf7f9fc;
+    if(statusView) { statusColor = 0xd5e7fa; }
+    Task<int64> selected = spawn DrawCanvasFillRectRaw(canvas, 26, 105, 138, 22, statusColor);
+    selected.await();
+    Task<int64> statusNode = spawn DrawCanvasTextRaw(canvas, "  Status", 16, 108, 0x243950);
+    statusNode.await();
+    Task<int64> channels = spawn DrawCanvasTextRaw(canvas, "  Channels", 16, 134, 0x243950);
+    channels.await();
+    Task<int64> roomNode = spawn IrcUiDrawConversationTreeRaw(canvas, conversations, selectedKey, height);
+    roomNode.await();
+
+    Task<int64> topicBar = spawn IrcUiPanel(canvas, 180, 76, chatWidth, 30, 0xf2f6fa);
+    topicBar.await();
+    Task<string> trimTopic = spawn StringTrimRaw(topic);
+    string trimmedTopic = trimTopic.await();
+    string heading = cat("Topic: ", trimmedTopic);
+    if(statusView) {
+        c { o9_string_release(heading); }
+        heading = "Network status and server replies";
+    }
+    if(scrollBack > 0) {
+        string marked = cat(heading, "  [history]");
+        c { o9_string_release(heading); }
+        heading = marked;
+    }
+    Task<int64> topicText = spawn IrcUiScrollLabelRaw(canvas, heading, 188, 83,
+                                                       chatWidth - 16, labelTick,
+                                                       0x20344f);
+    int64 topicScrolling = topicText.await();
+    Task<int64> chat = spawn IrcUiPanel(canvas, 180, 112, chatWidth, chatHeight, 0xffffff);
+    chat.await();
+    string visible = transcript;
+    if(statusView) { visible = statuslog; }
+    Task<int64> highlight = spawn IrcUiHighlightRaw(canvas, visible, chatWidth, chatHeight,
+                                                     scrollBack, selectionStart, selectionEnd);
+    highlight.await();
+    Task<int64> messages = spawn IrcUiChatRaw(canvas, visible, chatWidth, chatHeight,
+                                               scrollBack, -1, -1, 0, 0, 2);
+    messages.await();
+
+    Task<int64> nickBar = spawn IrcUiPanel(canvas, nickX, 76, 142, 30, 0xf2f6fa);
+    nickBar.await();
+    Task<int64> nickTitle = spawn DrawCanvasTextRaw(canvas, "Nicks", nickX + 8, 83, 0x20344f);
+    nickTitle.await();
+    Task<int64> nickBox = spawn IrcUiPanel(canvas, nickX, 112, 142, chatHeight, 0xf9fbfe);
+    nickBox.await();
+    Task<int64> names = spawn IrcUiLines(canvas, nicks, nickX, 112, 142, chatHeight, false, 0);
+    names.await();
+
+    Task<int64> edit = spawn IrcUiPaintInput(canvas, width, height, input, false);
+    edit.await();
+    Task<int64> footer = spawn IrcUiPanel(canvas, 6, height - 26, width - 12, 20, 0xe3ebf4);
+    footer.await();
+    Task<string> trimStatus = spawn StringTrimRaw(connection);
+    string trimmedStatus = trimStatus.await();
+    string footerLabel = cat("o9irc  |  ", trimmedStatus);
+    Task<int64> statusText = spawn DrawCanvasTextRaw(canvas, footerLabel, 14, height - 23, 0x334860);
+    statusText.await();
+    int64 result = 1;
+    if(flushNow) {
+        Task<int64> flush = spawn DrawCanvasFlushRaw(canvas);
+        result = flush.await();
+        c { o9_task_close(flush); }
+    }
+    c {
+        o9_task_close(op);
+        o9_task_close(toolbar);
+        o9_task_close(title);
+        o9_task_close(menuSurface);
+        o9_task_close(menuLabel);
+        o9_task_close(tools);
+        o9_task_close(switchbar);
+        o9_task_close(tabMark);
+        o9_task_close(trimRoom);
+        o9_task_close(tabs);
+        o9_task_close(roomLabel);
+        o9_task_close(tree);
+        o9_task_close(network);
+        o9_task_close(selected);
+        o9_task_close(statusNode);
+        o9_task_close(channels);
+        o9_task_close(roomNode);
+        o9_task_close(topicBar);
+        o9_task_close(trimTopic);
+        o9_task_close(topicText);
+        o9_task_close(chat);
+        o9_task_close(highlight);
+        o9_task_close(messages);
+        o9_task_close(nickBar);
+        o9_task_close(nickTitle);
+        o9_task_close(nickBox);
+        o9_task_close(names);
+        o9_task_close(edit);
+        o9_task_close(footer);
+        o9_task_close(trimStatus);
+        o9_task_close(statusText);
+        o9_string_release(room);
+        o9_string_release(trimmedTopic);
+        o9_string_release(heading);
+        o9_string_release(trimmedStatus);
+        o9_string_release(footerLabel);
+    }
+    if(result <= 0) { return 0; }
+    if(roomScrolling != 0 || topicScrolling != 0) { return 1; }
+    return 0;
+}
+
+class IrcSetup {
+    prop string host;
+    prop string port;
+    prop string nick;
+    prop string channel;
+    prop string realName;
+    prop bool tls;
+    prop string trustPath;
+    prop string feedback;
+    prop bool opened;
+    prop bool loaded;
+    prop bool shown;
+    prop bool mouseDown;
+    prop int64 focus;
+
+    method IrcSetup() {
+        host = "";
+        port = "6667";
+        nick = "";
+        channel = "";
+        realName = "";
+        tls = false;
+        trustPath = "";
+        feedback = "";
+        opened = false;
+        loaded = false;
+        shown = false;
+        mouseDown = false;
+        focus = 0;
+    }
+
+    method bool visible() { return opened; }
+
+    method void show() {
+        opened = true;
+        focus = 0;
+        feedback = "";
+    }
+
+    method bool load(string path) {
+        if(loaded) { return false; }
+        string savedProfile = readfile(path);
+        if(len(savedProfile) == 0) { return false; }
+        Task<string> hostField = spawn StringFieldRaw(savedProfile, "\t", 0);
+        Task<string> portField = spawn StringFieldRaw(savedProfile, "\t", 1);
+        Task<string> nickField = spawn StringFieldRaw(savedProfile, "\t", 2);
+        Task<string> channelField = spawn StringFieldRaw(savedProfile, "\t", 3);
+        Task<string> nameField = spawn StringFieldRaw(savedProfile, "\t", 4);
+        Task<string> transportField = spawn StringFieldRaw(savedProfile, "\t", 5);
+        Task<string> trustField = spawn StringFieldRaw(savedProfile, "\t", 6);
+        host = hostField.take();
+        port = portField.take();
+        nick = nickField.take();
+        channel = channelField.take();
+        realName = nameField.take();
+        string savedTransport = transportField.take();
+        tls = cmp(savedTransport, "tls") == 0;
+        savedTransport.dispose();
+        trustPath = trustField.take();
+        loaded = true;
+        savedProfile.dispose();
+        return true;
+    }
+
+    method bool showIfDisconnected(string status) {
+        if(loaded && !shown && cmp(status, "disconnected\n") == 0) {
+            show();
+            shown = true;
+            return true;
+        }
+        return false;
+    }
+
+    method bool submit(string inputPath, bool connectNow) {
+        if(len(host) == 0 || len(port) == 0 || len(nick) == 0) {
+            feedback = "Enter a server, port, and nickname.";
+            return false;
+        }
+        if(tls && len(trustPath) == 0) {
+            feedback = "Choose a trusted-keys file before enabling TLS.";
+            return false;
+        }
+        Task<string> profileCommand = spawn IrcUiProfileCommandRaw(
+            connectNow, host, port, nick, channel, realName, tls, trustPath);
+        string command = profileCommand.take();
+        Task<int64> written = spawn IrcUiWriteInputRaw(inputPath, command);
+        bool ok = written.take() >= 0;
+        command.dispose();
+        if(ok) {
+            feedback = "";
+            opened = false;
+        } else {
+            feedback = "Check the settings or start the IRC service.";
+        }
+        return ok;
+    }
+
+    method bool mouse(int64 eventCode, int64 width, int64 height, string inputPath) {
+        int64 buttons = (eventCode >> 4) & 31;
+        bool pressed = (buttons & 1) != 0;
+        int64 x = (eventCode >> 9) & 2047;
+        int64 y = (eventCode >> 20) & 2047;
+        int64 left = (width-580)/2;
+        int64 top = (height-492)/2;
+        bool changed = false;
+        if(pressed && !mouseDown) {
+            if(x >= left+16 && x < left+564 && y >= top+81 &&
+               y < top+81+5*47) {
+                focus = (y-(top+81))/47;
+                changed = true;
+            }
+            if(x >= left+16 && x < left+564 && y >= top+318 && y < top+352) {
+                tls = !tls;
+                if(tls && cmp(port, "6667") == 0) { port = "6697"; }
+                focus = 5;
+                changed = true;
+            }
+            if(x >= left+16 && x < left+564 && y >= top+360 && y < top+398) {
+                focus = 6;
+                changed = true;
+            }
+            if(y >= top+438 && y < top+480) {
+                if(x >= left+384 && x < left+564) {
+                    opened = false;
+                    changed = true;
+                } else if(x >= left+16 && x < left+370) {
+                    submit(inputPath, x >= left+190);
+                    changed = true;
+                }
+            }
+        }
+        mouseDown = pressed;
+        return changed;
+    }
+
+    method bool key(int64 code) {
+        if(code == 0x1b) {
+            opened = false;
+            return true;
+        }
+        if(code == 9 || code == 10 || code == 13) {
+            focus = (focus+1)%7;
+            return true;
+        }
+        if(focus == 5 && code == 32) {
+            tls = !tls;
+            if(tls && cmp(port, "6667") == 0) { port = "6697"; }
+            return true;
+        }
+        if(code != 8 && code != 0x7f && (code < 32 || code > 126)) {
+            return false;
+        }
+        if(focus == 0) {
+            Task<string> edited = spawn IrcUiFieldEditRaw(host, code, 253);
+            string previous = host;
+            host = edited.take();
+            previous.dispose();
+        } else if(focus == 1) {
+            Task<string> edited = spawn IrcUiFieldEditRaw(port, code, 5);
+            string previous = port;
+            port = edited.take();
+            previous.dispose();
+        } else if(focus == 2) {
+            Task<string> edited = spawn IrcUiFieldEditRaw(nick, code, 30);
+            string previous = nick;
+            nick = edited.take();
+            previous.dispose();
+        } else if(focus == 3) {
+            Task<string> edited = spawn IrcUiFieldEditRaw(channel, code, 64);
+            string previous = channel;
+            channel = edited.take();
+            previous.dispose();
+        } else if(focus == 4) {
+            Task<string> edited = spawn IrcUiFieldEditRaw(realName, code, 80);
+            string previous = realName;
+            realName = edited.take();
+            previous.dispose();
+        } else if(focus == 6) {
+            Task<string> edited = spawn IrcUiFieldEditRaw(trustPath, code, 255);
+            string previous = trustPath;
+            trustPath = edited.take();
+            previous.dispose();
+        }
+        feedback = "";
+        return true;
+    }
+
+    method void paint(int64 canvas, int64 width, int64 height) {
+        Task<int64> drawn = spawn IrcUiPaintSetup(canvas, width, height,
+            host, port, nick, channel, realName, tls, trustPath, focus, feedback);
+        drawn.take();
+    }
+}
+
+function IrcUiEventRaw(int64 canvas) int64 {
+    use { draw event }
+    int64 eventCode = 0;
+    c {
+                    Event ev;
+                    int et;
+                    ulong x, y, buttons, key;
+
+                    if(canvas > 0 && display != nil){
+                        if(o9_draw_resized){
+                            o9_draw_resized = 0;
+                            x = o9_draw_width & 0x7FF;
+                            y = o9_draw_height & 0x7FF;
+                            eventCode = (y << 20) | (x << 9) | 3;
+                        }else{
+                            et = event(&ev);
+                            if(o9_draw_resized){
+                                o9_draw_resized = 0;
+                                x = o9_draw_width & 0x7FF;
+                                y = o9_draw_height & 0x7FF;
+                                eventCode = (y << 20) | (x << 9) | 3;
+                            }else if(et == Emouse){
+                                x = (ev.mouse.xy.x - screen->r.min.x) & 0x7FF;
+                                y = (ev.mouse.xy.y - screen->r.min.y) & 0x7FF;
+                                buttons = ev.mouse.buttons & 0x1F;
+                                eventCode = (y << 20) | (x << 9) | (buttons << 4) | 1;
+                            }else if(et == Ekeyboard){
+                                key = ev.kbdc & 0xFFFF;
+                                eventCode = (key << 9) | 2;
+                            }
+                        }
+                    }
+                }
+    return eventCode;
+}
+
+function IrcUiRun() int64 {
+    string mountPoint = "/mnt/o9irc";
+    Task<int64> argCount = spawn ProcessArgcRaw();
+    if(argCount.await() > 2) {
+        Task<string> arg = spawn ProcessArgRaw(2);
+        mountPoint = arg.await();
+    }
+    string base = cat(mountPoint, "/view/networks/default/");
+    Task<int64> opened = spawn DrawCanvasOpenRaw("o9irc", 960, 660);
+    int64 canvas = opened.await();
+    if(canvas <= 0) {
+        print("o9irc: cannot open Rio draw window\n");
+    } else {
+        Task<int64> timer = spawn IrcUiStartTimerRaw();
+        timer.await();
+        timer.take();
+        int64 width = 960;
+        int64 height = 660;
+        string connection = "waiting for 9P view";
+        string channel = "";
+        string topic = "";
+        string transcript = "";
+        string statuslog = "";
+        string nicks = "";
+        string input = "";
+        string conversations = "";
+        string selectedKey = "";
+        string selectedName = "";
+        string activePathKey = "";
+        Dict<string,int64> scrolls;
+        string statusPath = cat(base, "status");
+        string channelPath = cat(base, "channel");
+        string conversationsPath = cat(base, "conversations");
+        string topicPath = cat(base, "topic");
+        string transcriptPath = cat(base, "transcript");
+        string statuslogPath = cat(base, "statuslog");
+        string eventsPath = cat(base, "events");
+        string nicksPath = cat(base, "nicks");
+        string inputPath = cat(base, "input");
+        string profilePath = cat(base, "profile");
+        IrcSetup setup = new IrcSetup();
+        bool statusView = false;
+        int64 channelBack = 0;
+        int64 statusBack = 0;
+        bool mouseDown = false;
+        bool selecting = false;
+        bool basePainted = false;
+        int64 selectionStart = -1;
+        int64 selectionEnd = -1;
+        bool dirty = true;
+        bool setupDirty = false;
+        bool labelsDirty = false;
+        bool inputDirty = false;
+        bool labelsScrolling = false;
+        int64 labelTick = 0;
+        int64 timerTicks = 0;
+        bool running = true;
+        while(running) {
+            if(running) {
+                // Keep the packed event in 31 bits for the o9c 386 backend.
+                // Poll here so the timer does not create an actor every tick.
+                Task<int64> polled = spawn IrcUiEventRaw(canvas);
+                int64 eventCode = polled.take();
+                int64 kind = eventCode & 15;
+                bool setupWasOpen = setup.visible();
+                if(kind == 0) {
+                    timerTicks = timerTicks + 1;
+                    if(labelsScrolling && timerTicks % 3 == 0) {
+                        labelTick = labelTick + 1;
+                        labelsDirty = true;
+                    }
+                }
+                if(kind == 1 && setupWasOpen) {
+                    if(setup.mouse(eventCode, width, height, inputPath)) {
+                        if(setup.visible()) { setupDirty = true; }
+                        else { dirty = true; }
+                    }
+                }
+                if(kind == 1 && !setupWasOpen) {
+                    int64 buttons = (eventCode >> 4) & 31;
+                    bool pressed = (buttons & 1) != 0;
+                    bool middlePressed = (buttons & 2) != 0;
+                    bool rightPressed = (buttons & 4) != 0;
+                    int64 x = (eventCode >> 9) & 2047;
+                    int64 y = (eventCode >> 20) & 2047;
+                    bool inChat = y >= 112 && y < height - 72 && x >= 180 && x < width - 160;
+                    if(inChat && (buttons & 24) != 0) {
+                        string visible = transcript;
+                        int64 back = channelBack;
+                        if(statusView) {
+                            visible = statuslog;
+                            back = statusBack;
+                        }
+                        if((buttons & 8) != 0) { back = back + 3; }
+                        if((buttons & 16) != 0) { back = back - 3; }
+                        Task<int64> maximum = spawn IrcUiMaxBack(visible, width, height);
+                        int64 maxBack = maximum.await();
+                        if(back < 0) { back = 0; }
+                        if(back > maxBack) { back = maxBack; }
+                        if(statusView) { statusBack = back; } else { channelBack = back; }
+                        dirty = true;
+                    }
+                    if(pressed && !mouseDown && inChat) {
+                        string visible = transcript;
+                        int64 back = channelBack;
+                        if(statusView) { visible = statuslog; back = statusBack; }
+                        Task<int64> hit = spawn IrcUiHitChatRaw(visible, width - 340,
+                            height - 184, back, x, y);
+                        selectionStart = hit.take();
+                        selectionEnd = selectionStart;
+                        selecting = true;
+                        dirty = true;
+                    } else if(selecting) {
+                        string visible = transcript;
+                        int64 back = channelBack;
+                        if(statusView) { visible = statuslog; back = statusBack; }
+                        Task<int64> hit = spawn IrcUiHitChatRaw(visible, width - 340,
+                            height - 184, back, x, y);
+                        int64 position = hit.take();
+                        if(selectionEnd != position) {
+                            selectionEnd = position;
+                            dirty = true;
+                        }
+                        if(!pressed) { selecting = false; }
+                    }
+                    bool copySelected = middlePressed && inChat;
+                    bool menuClick = pressed && !mouseDown && y >= 6 && y < 34 && x >= 94 && x < 260;
+                    bool contextClick = rightPressed;
+                    bool usedMenu = false;
+                    if(menuClick || contextClick) {
+                        int64 button = 1;
+                        if(contextClick) { button = 3; }
+                        Task<int64> picked = spawn DrawMenuHitRaw(canvas, button, x, y, buttons, 8,
+                            "connection setup", "status view", "join channel", "change nick",
+                            "message nick", "quit IRC", "close window", "copy selection");
+                        int64 choice = picked.await();
+                        if(choice == 0) {
+                            setup.show();
+                            setupDirty = true;
+                        } else if(choice == 1) {
+                            statusView = true;
+                            selectionStart = -1;
+                            selectionEnd = -1;
+                            selecting = false;
+                            dirty = true;
+                        } else if(choice == 2) {
+                            input = "/join #";
+                            inputDirty = true;
+                        } else if(choice == 3) {
+                            input = "/nick ";
+                            inputDirty = true;
+                        } else if(choice == 4) {
+                            input = "/msg ";
+                            inputDirty = true;
+                        } else if(choice == 5) {
+                            Task<int64> written = spawn IrcUiWriteInputRaw(inputPath, "quit\n");
+                            if(written.await() < 0) {
+                                connection = "quit rejected by 9P view";
+                            }
+                            dirty = true;
+                        } else if(choice == 6) {
+                            running = false;
+                        } else if(choice == 7) {
+                            copySelected = true;
+                        }
+                        usedMenu = true;
+                        dirty = true;
+                    } else if(pressed && !mouseDown) {
+                        if((y >= 40 && y < 68 && x >= 6 && x < 96) ||
+                           (y >= 102 && y < 128 && x >= 18 && x < 170)) {
+                            statusView = true;
+                            selectionStart = -1;
+                            selectionEnd = -1;
+                            selecting = false;
+                            dirty = true;
+                        } else if(y >= 156 && y < height - 68 && x >= 18 && x < 170) {
+                            int64 row = (y - 156) / 22;
+                            Task<string> newKey = spawn IrcUiIndexFieldRaw(conversations, row, false);
+                            string chosen = newKey.await();
+                            if(len(chosen) > 0 && cmp(chosen, selectedKey) != 0) {
+                                if(len(selectedKey) > 0) { scrolls[selectedKey] = channelBack; }
+                                selectedKey.dispose(); selectedName.dispose();
+                                selectedKey = chosen;
+                                Task<string> newName = spawn IrcUiIndexFieldRaw(conversations, row, true);
+                                selectedName = newName.await();
+                                channelBack = 0;
+                                if(scrolls.Has(selectedKey)) { channelBack = scrolls[selectedKey]; }
+                            }
+                            statusView = false;
+                            selectionStart = -1;
+                            selectionEnd = -1;
+                            selecting = false;
+                            dirty = true;
+                        } else if(y >= 40 && y < 68 && x >= 96 && x < width - 12) {
+                            statusView = false;
+                            selectionStart = -1;
+                            selectionEnd = -1;
+                            selecting = false;
+                            dirty = true;
+                        } else if(y >= 112 && y < height - 72 && x >= width - 154 && x < width - 12) {
+                            int64 index = (y - 118) / 18;
+                            Task<string> field = spawn StringFieldRaw(nicks, "\n", index);
+                            Task<string> trimmed = spawn StringTrimRaw(field.await());
+                            string who = trimmed.await();
+                            if(len(who) > 0) {
+                                Task<int64> op = spawn StringStartsWithRaw(who, "@");
+                                Task<int64> voice = spawn StringStartsWithRaw(who, "+");
+                                if(op.await() != 0 || voice.await() != 0) {
+                                    Task<string> bare = spawn StringSliceRaw(who, 1, len(who) - 1);
+                                    who = bare.await();
+                                }
+                                input = cat(cat("/msg ", who), " ");
+                                inputDirty = true;
+                            }
+                        }
+                    }
+                    if(copySelected && selectionStart >= 0 && selectionStart != selectionEnd) {
+                        string visible = transcript;
+                        if(statusView) { visible = statuslog; }
+                        Task<int64> copied = spawn IrcUiCopySelectionRaw(visible,
+                            selectionStart, selectionEnd);
+                        copied.take();
+                    }
+                    if(usedMenu) {
+                        mouseDown = false;
+                    } else {
+                        mouseDown = pressed;
+                    }
+                }
+                if(kind == 2 && setupWasOpen) {
+                    if(setup.key((eventCode >> 9) & 65535)) {
+                        if(setup.visible()) { setupDirty = true; }
+                        else { dirty = true; }
+                    }
+                }
+                if(kind == 2 && !setupWasOpen) {
+                    int64 key = (eventCode >> 9) & 65535;
+                    if(key == 0x1b) {
+                        running = false;
+                    } else if(key == 0xF00F || key == 0xF013 ||
+                              key == 0xF00D || key == 0xF018) {
+                        string visible = transcript;
+                        int64 back = channelBack;
+                        if(statusView) {
+                            visible = statuslog;
+                            back = statusBack;
+                        }
+                        Task<int64> maximum = spawn IrcUiMaxBack(visible, width, height);
+                        int64 maxBack = maximum.await();
+                        int64 page = (height - 196) / 18;
+                        if(page < 1) { page = 1; }
+                        if(key == 0xF00F) { back = back + page; }
+                        if(key == 0xF013) { back = back - page; }
+                        if(key == 0xF00D) { back = maxBack; }
+                        if(key == 0xF018) { back = 0; }
+                        if(back < 0) { back = 0; }
+                        if(back > maxBack) { back = maxBack; }
+                        if(statusView) { statusBack = back; } else { channelBack = back; }
+                        dirty = true;
+                    } else if(key == 8 || key == 0x7f) {
+                        if(len(input) > 0) {
+                            Task<string> shortened = spawn StringSliceRaw(input, 0, len(input) - 1);
+                            input = shortened.await();
+                            inputDirty = true;
+                        }
+                    } else if(key == 10 || key == 13) {
+                        if(len(input) > 0) {
+                            string command = cat("say ", input);
+                            if(len(selectedName) > 0) {
+                                command.dispose();
+                                command = cat(cat(cat("msg ", selectedName), " "), input);
+                            }
+                            Task<int64> slash = spawn StringStartsWithRaw(input, "/");
+                            if(slash.await() != 0) {
+                                Task<string> withoutSlash = spawn StringSliceRaw(input, 1, len(input) - 1);
+                                command.dispose();
+                                command = withoutSlash.await();
+                            }
+                            Task<int64> written = spawn IrcUiWriteInputRaw(inputPath, cat(command, "\n"));
+                            if(written.await() < 0) {
+                                connection = "command rejected by 9P view";
+                                dirty = true;
+                            } else {
+                                input = "";
+                            }
+                            inputDirty = true;
+                        }
+                    } else if(key >= 32 && key <= 126) {
+                        Task<string> inserted = spawn DrawTextInsertRaw(input, len(input), key);
+                        input = inserted.await();
+                        inputDirty = true;
+                    }
+                }
+                if(kind == 3) {
+                    width = (eventCode >> 9) & 2047;
+                    height = (eventCode >> 20) & 2047;
+                    if(width < 640) { width = 640; }
+                    if(height < 440) { height = 440; }
+                    basePainted = false;
+                    dirty = true;
+                }
+            }
+            if(setup.load(profilePath)) {
+                if(setup.visible()) { setupDirty = true; }
+                else { dirty = true; }
+            }
+            string nextConversations = readfile(conversationsPath);
+            if(cmp(nextConversations, conversations) != 0) {
+                conversations.dispose();
+                conversations = nextConversations;
+                if(len(selectedKey) == 0 && len(conversations) > 0) {
+                    Task<string> firstKey = spawn IrcUiIndexFieldRaw(conversations, 0, false);
+                    Task<string> firstName = spawn IrcUiIndexFieldRaw(conversations, 0, true);
+                    selectedKey = firstKey.await();
+                    selectedName = firstName.await();
+                }
+                dirty = true;
+            } else {
+                nextConversations.dispose();
+            }
+            if(cmp(activePathKey, selectedKey) != 0) {
+                activePathKey.dispose(); topicPath.dispose(); transcriptPath.dispose(); nicksPath.dispose();
+                activePathKey = cat(selectedKey, "");
+                string selectedRoot = cat(base, selectedKey);
+                topicPath = cat(selectedRoot, "/topic");
+                transcriptPath = cat(selectedRoot, "/transcript");
+                nicksPath = cat(selectedRoot, "/nicks");
+                selectedRoot.dispose();
+            }
+            string nextConnection = readfile(statusPath);
+            if(setup.showIfDisconnected(nextConnection)) { setupDirty = true; }
+            string nextChannel = readfile(channelPath);
+            if(len(selectedName) > 0) {
+                nextChannel.dispose();
+                nextChannel = cat(selectedName, "\n");
+            }
+            string nextTopic = readfile(topicPath);
+            string nextTranscript = readfile(transcriptPath);
+            string nextStatuslog = readfile(statuslogPath);
+            if(len(nextStatuslog) == 0) {
+                nextStatuslog.dispose();
+                nextStatuslog = readfile(eventsPath);
+            }
+            string nextNicks = readfile(nicksPath);
+            if(len(nextConnection) == 0) {
+                nextConnection.dispose();
+                nextConnection = "9P view unavailable: mount /srv/ircfs first";
+            }
+            if(cmp(nextConnection, connection) != 0 || cmp(nextChannel, channel) != 0 ||
+               cmp(nextTopic, topic) != 0 || cmp(nextTranscript, transcript) != 0 ||
+               cmp(nextStatuslog, statuslog) != 0 ||
+               cmp(nextNicks, nicks) != 0) {
+                if((statusView && cmp(nextStatuslog, statuslog) != 0) ||
+                   (!statusView && cmp(nextTranscript, transcript) != 0)) {
+                    selectionStart = -1;
+                    selectionEnd = -1;
+                    selecting = false;
+                }
+                if(channelBack > 0 && cmp(nextTranscript, transcript) != 0) {
+                    Task<int64> oldLines = spawn IrcUiChatRaw(0, transcript,
+                        width - 340, height - 184, 0, -1, -1, 0, 0, 0);
+                    Task<int64> newLines = spawn IrcUiChatRaw(0, nextTranscript,
+                        width - 340, height - 184, 0, -1, -1, 0, 0, 0);
+                    int64 added = newLines.await() - oldLines.await();
+                    oldLines.take(); newLines.take();
+                    if(added > 0) { channelBack = channelBack + added; }
+                }
+                if(statusBack > 0 && cmp(nextStatuslog, statuslog) != 0) {
+                    Task<int64> oldLines = spawn IrcUiChatRaw(0, statuslog,
+                        width - 340, height - 184, 0, -1, -1, 0, 0, 0);
+                    Task<int64> newLines = spawn IrcUiChatRaw(0, nextStatuslog,
+                        width - 340, height - 184, 0, -1, -1, 0, 0, 0);
+                    int64 added = newLines.await() - oldLines.await();
+                    oldLines.take(); newLines.take();
+                    if(added > 0) { statusBack = statusBack + added; }
+                }
+                connection.dispose(); channel.dispose(); topic.dispose(); transcript.dispose(); statuslog.dispose(); nicks.dispose();
+                connection = nextConnection;
+                channel = nextChannel;
+                topic = nextTopic;
+                transcript = nextTranscript;
+                statuslog = nextStatuslog;
+                nicks = nextNicks;
+                dirty = true;
+            } else {
+                nextConnection.dispose(); nextChannel.dispose(); nextTopic.dispose(); nextTranscript.dispose(); nextStatuslog.dispose(); nextNicks.dispose();
+            }
+            if(dirty && (!setup.visible() || !basePainted)) {
+                int64 scrollBack = channelBack;
+                if(statusView) { scrollBack = statusBack; }
+                Task<int64> painted = spawn IrcUiPaint(canvas, width, height, connection, channel,
+                                                         topic, transcript, statuslog, nicks, input,
+                                                         conversations, selectedKey,
+                                                         statusView, scrollBack, labelTick,
+                                                         selectionStart, selectionEnd,
+                                                         !setup.visible());
+                labelsScrolling = painted.await() != 0;
+                painted.take();
+                if(setup.visible()) { setup.paint(canvas, width, height); }
+                basePainted = true;
+                dirty = false;
+                setupDirty = false;
+                labelsDirty = false;
+                inputDirty = false;
+            } else if(setup.visible() && setupDirty) {
+                setup.paint(canvas, width, height);
+                setupDirty = false;
+            } else if(inputDirty && !setup.visible()) {
+                Task<int64> paintedInput = spawn IrcUiPaintInput(canvas, width, height, input, true);
+                paintedInput.await();
+                paintedInput.take();
+                inputDirty = false;
+            } else if(labelsDirty && !setup.visible()) {
+                int64 scrollBack = channelBack;
+                if(statusView) { scrollBack = statusBack; }
+                Task<int64> paintedLabels = spawn IrcUiPaintLabels(canvas, width,
+                    channel, topic, statusView, scrollBack, labelTick);
+                labelsScrolling = paintedLabels.await() != 0;
+                paintedLabels.take();
+                labelsDirty = false;
+            }
+            if(setup.visible()) {
+                inputDirty = false;
+                labelsDirty = false;
+            }
+        }
+        Task<int64> closed = spawn DrawCanvasCloseRaw(canvas);
+        closed.await();
+        closed.take(); statusPath.dispose(); channelPath.dispose(); conversationsPath.dispose(); topicPath.dispose(); transcriptPath.dispose(); statuslogPath.dispose(); eventsPath.dispose(); nicksPath.dispose(); inputPath.dispose(); profilePath.dispose(); connection.dispose(); channel.dispose(); topic.dispose(); transcript.dispose(); statuslog.dispose(); nicks.dispose(); input.dispose(); conversations.dispose(); selectedKey.dispose(); selectedName.dispose(); activePathKey.dispose(); base.dispose(); mountPoint.dispose();
+    }
+    return 0;
+}
+
+main {
+    Task<int64> run = spawn IrcUiRun();
+    run.await();
+}

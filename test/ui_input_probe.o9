@@ -1,0 +1,14 @@
+import "uiio.o9";
+import "process.o9";
+
+main {
+    Task<string> path = spawn ProcessArgRaw(2);
+    string command = "say from view\n";
+    Task<int64> count = spawn ProcessArgcRaw();
+    if(count.await() > 3) {
+        Task<string> chosen = spawn ProcessArgRaw(3);
+        command = cat(chosen.await(), "\n");
+    }
+    Task<int64> written = spawn IrcUiWriteInputRaw(path.await(), command);
+    print("o9irc-ui-write: ", written.await(), "\n");
+}

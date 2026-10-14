@@ -1,0 +1,60 @@
+#!/bin/rc
+# Run the IRC actor and Rio view in one namespace.
+if(! ~ $#* 0 && ! ~ $#* 3){
+	echo 'usage: o9irc-start [dial-address nickname #channel]' >[1=2]
+	exit usage
+}
+service=o9irc
+mountpoint=/mnt/o9irc
+if(! test -d $mountpoint)
+	mkdir $mountpoint
+if(! test -e /srv/$service){
+	if(~ $#* 0){
+		historydir=$o9irchistorydir
+		if(~ $#historydir 0)
+			historydir=$home/lib/o9irc
+		historymax=$o9irchistorybytes
+		if(~ $#historymax 0)
+			historymax=262144
+		o9ircfs $service '' '' '' $historydir $historymax </dev/null >/tmp/o9irc.log >[2=1] &
+	}
+	if not {
+		historydir=$o9irchistorydir
+		if(~ $#historydir 0)
+			historydir=$home/lib/o9irc
+		historymax=$o9irchistorybytes
+		if(~ $#historymax 0)
+			historymax=262144
+		o9ircfs $service $1 $2 $3 $historydir $historymax </dev/null >/tmp/o9irc.log >[2=1] &
+	}
+	ready=no
+	for(i in 1 2 3 4 5){
+		if(test -e /srv/$service)
+			ready=yes
+		if(~ $ready no)
+			sleep 1
+	}
+	if(~ $ready no){
+		echo 'o9irc service did not start; see /tmp/o9irc.log' >[1=2]
+		exit startup
+	}
+}
+mounted=no
+for(i in 1 2 3 4 5){
+    if(~ $mounted no){
+        if(mount -c /srv/$service $mountpoint){
+            if(test -e $mountpoint/view/networks/default/status)
+                mounted=yes
+            if not
+                unmount $mountpoint
+        }
+        if(~ $mounted no)
+            sleep 1
+    }
+}
+if(~ $mounted no){
+    echo 'o9irc 9P view did not become ready' >[1=2]
+    exit mount
+}
+o9irc-gui o9irc-gui $mountpoint
+unmount $mountpoint

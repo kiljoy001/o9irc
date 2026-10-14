@@ -1,0 +1,11 @@
+// Send the exact bytes of a prepared command through the GUI's 9P writer.
+import "process.o9";
+import "uiio.o9";
+
+main {
+    Task<string> input = spawn ProcessArgRaw(2);
+    Task<string> source = spawn ProcessArgRaw(3);
+    string command = readfile(source.take());
+    Task<int64> written = spawn IrcUiWriteInputRaw(input.take(), command);
+    print("o9irc-profile-write: ", written.take(), "\n");
+}

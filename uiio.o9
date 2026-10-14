@@ -1,0 +1,23 @@
+// Write to an existing 9P command file at offset zero.
+function IrcUiWriteInputRaw(string path, string data) int64 {
+    int64 out;
+    c {
+        char *name;
+        int fd;
+        vlong n;
+
+        out = -1;
+        name = o9_string_cstr(path);
+        if(name != nil){
+            fd = open(name, OWRITE);
+            free(name);
+            if(fd >= 0){
+                n = o9_string_len(data);
+                if(write(fd, o9_string_data(data), n) == n)
+                    out = n;
+                close(fd);
+            }
+        }
+    }
+    return out;
+}

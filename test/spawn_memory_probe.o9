@@ -1,0 +1,18 @@
+import "time.o9";
+
+main {
+    Task<int64> warmup = spawn TimeSleepRaw(5000);
+    warmup.take();
+    print("SPAWN_PROBE_START\n");
+    Task<int64> pause = spawn TimeSleepRaw(5000);
+    pause.take();
+    int64 i = 0;
+    while(i < 500) {
+        Task<int64> now = spawn TimeNowRaw();
+        now.take();
+        i = i + 1;
+    }
+    print("SPAWN_PROBE_DONE\n");
+    Task<int64> linger = spawn TimeSleepRaw(30000);
+    linger.take();
+}

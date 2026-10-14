@@ -1,0 +1,84 @@
+// Shared IRC wire framing. Both frontends use the same sender.
+import "net.o9";
+import "bytes.o9";
+import "string.o9";
+
+// Keep each IRC frame within the traditional 512 byte limit, including CRLF.
+function IrcSend(string fd, string line) bool {
+    byte crbyte = 13;
+    Task<string> crtext = spawn BytesAppendRaw("", crbyte);
+    string crchar = crtext.take();
+    Task<int64> cr = spawn StringIndexOfRaw(line, crchar);
+    Task<int64> lf = spawn StringIndexOfRaw(line, "\n");
+    int64 crpos = cr.take();
+    int64 lfpos = lf.take();
+    // A missing index is -1 on amd64 and 4294967295 on 386.
+    if(len(line) == 0 || len(line) > 510 ||
+       (crpos >= 0 && crpos < len(line)) ||
+       (lfpos >= 0 && lfpos < len(line))) {
+        print("irc: invalid or oversized outgoing line\n");
+        crchar.dispose();
+        return false;
+    }
+    string first = cat(line, crchar);
+    string frame = cat(first, "\n");
+    first.dispose();
+    Task<int64> sent = spawn NetWriteRaw(fd, frame);
+    bool ok = sent.take() == len(frame);
+    frame.dispose();
+    crchar.dispose();
+    return ok;
+}
+
+// Return the command and parameters after optional IRCv3 tags and prefix.
+function IrcPayload(string line) string {
+    string out;
+    c {
+        char *p, *end, *space;
+
+        p = o9_string_data(line);
+        end = p + o9_string_len(line);
+        if(p < end && *p == '@'){
+            space = memchr(p, ' ', end - p);
+            p = space != nil ? space + 1 : end;
+        }
+        if(p < end && *p == ':'){
+            space = memchr(p, ' ', end - p);
+            p = space != nil ? space + 1 : end;
+        }
+        out = o9_string_new(p, end - p);
+    }
+    return out;
+}
+
+// Use a short, widely accepted nickname when registration reports 433.
+// Attempt 1 is base_, followed by base_2 through base_9.
+function IrcNickFallbackRaw(string base, int64 attempt) string {
+    string out;
+    c {
+        char suffix[8], nick[16];
+        char *name;
+        int length, room;
+
+        out = o9_string_from_c("");
+        if(attempt >= 1 && attempt <= 9){
+            if(attempt == 1)
+                snprint(suffix, sizeof suffix, "_");
+            else
+                snprint(suffix, sizeof suffix, "_%lld", attempt);
+            name = o9_string_data(base);
+            length = o9_string_len(base);
+            if(name == nil || length == 0){
+                name = "guest";
+                length = 5;
+            }
+            room = 9 - strlen(suffix);
+            if(length > room)
+                length = room;
+            snprint(nick, sizeof nick, "%.*s%s", length, name, suffix);
+            o9_string_release(out);
+            out = o9_string_from_c(nick);
+        }
+    }
+    return out;
+}
