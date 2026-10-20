@@ -36,6 +36,7 @@ def main():
             "gui.o9": ROOT / "gui.o9",
             "uiio.o9": ROOT / "uiio.o9",
             "draw.o9": OBJECTIVE / "stdlib/draw.o9",
+            "time.o9": OBJECTIVE / "stdlib/time.o9",
             "rtext.o9": OBJECTIVE / "stdlib/rtext.o9",
             "ui_input_probe.o9": ROOT / "test/ui_input_probe.o9",
             "draw_pack_probe.o9": OBJECTIVE / "stdlib/e2e_draw_pack.o9",

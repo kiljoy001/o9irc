@@ -145,6 +145,20 @@ O9IRC_MEMORY_ONLY=1 python3 test/test_gui_mouse_qemu.py /path/to/graphical-9fron
 O9IRC_STRESS_COUNT=200 python3 test/test_ircfs_qemu.py /path/to/9front-with-current-o9c.img
 ```
 
+Host-side logic checks run without QEMU. They need plan9port and a host build
+of objective-9c's runtime:
+
+```sh
+O9_HOST_BUILD=/tmp/o9host sh ../objective-9c/tools/host_test.sh
+O9_HOST_BUILD=/tmp/o9host python3 test/host_logic.py
+```
+
+The second command transpiles the real GUI, protocol, and history modules with
+`o9c --no-facade`, links objective-9c's host runtime, and checks input/profile
+helpers, the zlib history roundtrip, and transcript wrapping and hit testing.
+It also runs `test/check_task_lifetime.py`, which rejects a `Task.await()` left
+without a matching close in long-running code.
+
 The IRC tests boot a temporary copy of the image, build the client inside
 9front, and talk to a small IRC server on the host. They leave the source
 image alone.

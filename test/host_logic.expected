@@ -1,0 +1,32 @@
+idx0key=<channels/23>
+idx1name=<alice>
+idx2empty=<>
+edit-append=<abcd>
+edit-limit=<abcdefgh>
+edit-back=<ab>
+profile-tcp=<profile	host	6667	nick	#chan	Real Name	tcp	
+>
+profile-tls=<connect	host	6697	nick	#chan		tls	/tmp/keys
+>
+uiempty=-1
+uiwrite=3
+nick1=<testnick_>
+nick9=<abcdefg_9>
+payload=<PRIVMSG #c :hello>
+histlimit0=0
+histlimit1=4096
+histlimitbad=262144
+histdrop=<cccccccc
+dddddddd
+>
+histsave=1
+histroundtrip=1
+histreject=0
+font=1
+layoutmatch=1
+maxbackpos=1
+hitorder=1
+hitlastpos=1
+otherlayoutpos=1
+otherhitstart=1
+HOST LOGIC DONE

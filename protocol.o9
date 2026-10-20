@@ -1,7 +1,11 @@
 // Shared IRC wire framing. Both frontends use the same sender.
+// Keep string.o9 first. The current o9c emits imported class bodies in
+// first-import order; net.o9's NetConn uses String before string.o9's class
+// body is emitted unless String is seen first, which makes the generated C
+// reference an undeclared String_Internal.
+import "string.o9";
 import "net.o9";
 import "bytes.o9";
-import "string.o9";
 
 // Keep each IRC frame within the traditional 512 byte limit, including CRLF.
 function IrcSend(string fd, string line) bool {

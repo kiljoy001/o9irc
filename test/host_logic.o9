@@ -1,0 +1,144 @@
+// Host-side logic checks for o9irc.  Build with o9c --no-facade and link
+// with objective-9c's host runtime (see host_logic.py).
+import "string.o9";
+import "protocol.o9";
+import "history.o9";
+import "file.o9";
+import "gui.o9";
+
+function HostFontRaw() int64 {
+    use { draw }
+    int64 out;
+    c {
+        font = openfont(nil, "*default*");
+        out = font != nil ? 1 : 0;
+    }
+    return out;
+}
+
+function HostNoiseRaw() string {
+    string out;
+    c {
+        uchar data[6000];
+        ulong state;
+        int i;
+
+        state = 0x12345678;
+        for(i = 0; i < sizeof data; i++){
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data[i] = state >> 16;
+        }
+        out = o9_string_new((char*)data, sizeof data);
+    }
+    return out;
+}
+
+main {
+    // Input adapter parsing.
+    string index = "channels/23\t#a\nusers/61\talice\n";
+    Task<string> i0 = spawn IrcUiIndexFieldRaw(index, 0, false);
+    print("idx0key=<", i0.take(), ">\n");
+    Task<string> i1 = spawn IrcUiIndexFieldRaw(index, 1, true);
+    print("idx1name=<", i1.take(), ">\n");
+    Task<string> i2 = spawn IrcUiIndexFieldRaw(index, 2, false);
+    print("idx2empty=<", i2.take(), ">\n");
+
+    // Connection form edit buffer.
+    Task<string> e1 = spawn IrcUiFieldEditRaw("abc", 100, 8);
+    print("edit-append=<", e1.take(), ">\n");
+    Task<string> e2 = spawn IrcUiFieldEditRaw("abcdefgh", 100, 8);
+    print("edit-limit=<", e2.take(), ">\n");
+    Task<string> e3 = spawn IrcUiFieldEditRaw("abc", 127, 8);
+    print("edit-back=<", e3.take(), ">\n");
+
+    // Profile command framing.
+    Task<string> p1 = spawn IrcUiProfileCommandRaw(false, "host", "6667", "nick",
+        "#chan", "Real Name", false, "");
+    print("profile-tcp=<", p1.take(), ">\n");
+    Task<string> p2 = spawn IrcUiProfileCommandRaw(true, "host", "6697", "nick",
+        "#chan", "", true, "/tmp/keys");
+    print("profile-tls=<", p2.take(), ">\n");
+
+    // The 9P input adapter must reject a zero-length write.
+    string inputPath = "/tmp/o9irc-host-input";
+    writefile(inputPath, "");
+    Task<int64> emptyWrite = spawn IrcUiWriteInputRaw(inputPath, "");
+    print("uiempty=", emptyWrite.take(), "\n");
+    Task<int64> okWrite = spawn IrcUiWriteInputRaw(inputPath, "ok\n");
+    print("uiwrite=", okWrite.take(), "\n");
+
+    // Protocol helpers.
+    Task<string> n1 = spawn IrcNickFallbackRaw("testnick", 1);
+    print("nick1=<", n1.take(), ">\n");
+    Task<string> n9 = spawn IrcNickFallbackRaw("abcdefghij", 9);
+    print("nick9=<", n9.take(), ">\n");
+    Task<string> pp = spawn IrcPayload("@a=b :nick!u@h PRIVMSG #c :hello");
+    print("payload=<", pp.take(), ">\n");
+
+    // History limit parsing, drop policy, and a zlib roundtrip.
+    Task<int64> hl0 = spawn IrcHistoryLimitRaw("0");
+    print("histlimit0=", hl0.take(), "\n");
+    Task<int64> hl1 = spawn IrcHistoryLimitRaw("4096");
+    print("histlimit1=", hl1.take(), "\n");
+    Task<int64> hlbad = spawn IrcHistoryLimitRaw("12");
+    print("histlimitbad=", hlbad.take(), "\n");
+    Task<string> hd = spawn IrcHistoryDropOldRaw("aaaaaaaa\nbbbbbbbb\ncccccccc\ndddddddd\n");
+    print("histdrop=<", hd.take(), ">\n");
+    string path = "/tmp/o9irc-host-logic.o9h";
+    string content = "[2026-10-19 12:00:00] <alice> hello\n[2026-10-19 12:00:01] <bob> world\n";
+    Task<int64> saved = spawn IrcHistorySaveRaw(path, content, 4096);
+    print("histsave=", saved.take(), "\n");
+    Task<string> loaded = spawn IrcHistoryLoadRaw(path);
+    print("histroundtrip=", cmp(loaded.take(), content) == 0, "\n");
+    Task<string> noise = spawn HostNoiseRaw();
+    Task<int64> rejected = spawn IrcHistorySaveRaw(path, noise.take(), 4096);
+    print("histreject=", rejected.take(), "\n");
+
+    // Transcript layout and hit testing share the same wrapping rules.
+    Task<int64> f = spawn HostFontRaw();
+    bool haveFont = f.take() != 0;
+    print("font=", haveFont, "\n");
+    string text = "";
+    int64 line = 0;
+    while(line < 40) {
+        Task<string> more = spawn StringRepeatRaw("word ", 20);
+        string repeated = more.take();
+        string row = cat(cat(repeated, " line "), "\n");
+        repeated.dispose();
+        string next = cat(text, row);
+        text.dispose();
+        text = next;
+        row.dispose();
+        line = line + 1;
+    }
+    Task<int64> c0 = spawn IrcUiChatIndexRaw(text, 200, 200, 0, 0, 0, 0);
+    int64 rows = c0.take();
+    Task<int64> raw0 = spawn IrcUiChatRaw(0, text, 200, 200, 0, -1, -1, 0, 0, 0, false);
+    int64 rawRows = raw0.take();
+    print("layoutmatch=", rows == rawRows, "\n");
+    Task<int64> max = spawn IrcUiMaxBack(text, 540, 400);
+    int64 maxBack = max.take();
+    print("maxbackpos=", maxBack > 0, "\n");
+    Task<int64> h0 = spawn IrcUiHitChatRaw(text, 200, 200, maxBack, 0, 118);
+    int64 hit0 = h0.take();
+    Task<int64> hx = spawn IrcUiHitChatRaw(text, 200, 200, maxBack, 250, 118);
+    int64 hitx = hx.take();
+    print("hitorder=", hit0 <= hitx, "\n");
+    Task<int64> hlast = spawn IrcUiHitChatRaw(text, 200, 200, 0, 250, 118 + 18 * 10);
+    int64 hitLast = hlast.take();
+    print("hitlastpos=", hitLast > hitx, "\n");
+
+    // A different transcript must rebuild the cached row index.
+    string other = "short line\nsecond line\n";
+    Task<int64> c1 = spawn IrcUiChatIndexRaw(other, 200, 200, 0, 0, 0, 0);
+    int64 otherRows = c1.take();
+    print("otherlayoutpos=", otherRows > 0, "\n");
+    Task<int64> o0 = spawn IrcUiHitChatRaw(other, 200, 200, 0, 0, 118);
+    print("otherhitstart=", o0.take() == 0, "\n");
+    other.dispose();
+
+    text.dispose();
+    print("HOST LOGIC DONE\n");
+}

@@ -13,8 +13,17 @@ function IrcUiWriteInputRaw(string path, string data) int64 {
             free(name);
             if(fd >= 0){
                 n = o9_string_len(data);
-                if(write(fd, o9_string_data(data), n) == n)
-                    out = n;
+                if(n > 0){
+                    vlong done = 0;
+                    while(done < n){
+                        vlong wrote = write(fd, o9_string_data(data) + done, n - done);
+                        if(wrote <= 0)
+                            break;
+                        done += wrote;
+                    }
+                    if(done == n)
+                        out = n;
+                }
                 close(fd);
             }
         }

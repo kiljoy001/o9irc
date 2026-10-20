@@ -108,7 +108,8 @@ def main():
             f'files.text("channels/2366697874757265/transcript", {transcript}, false);')
         sources = {"mock_view.o9": mock, "gui.o9": (ROOT / "gui.o9").read_text(),
                    "uiio.o9": (ROOT / "uiio.o9").read_text(),
-                   "draw.o9": (OBJECTIVE / "stdlib/draw.o9").read_text()}
+                   "draw.o9": (OBJECTIVE / "stdlib/draw.o9").read_text(),
+                   "time.o9": (OBJECTIVE / "stdlib/time.o9").read_text()}
         for name, content in sources.items():
             source = work / name
             source.write_text(content)
@@ -139,6 +140,10 @@ window -m -r 30 30 990 730 /usr/glenda/bin/ARCH/o9irc-gui gui /mnt/o9irc >/n/9fa
 window -miny 130
 """)
         riostart.write_text(riostart.read_text().replace("/ARCH/", f"/{ARCH}/"))
+        if os.environ.get("O9IRC_LATENCY") == "1":
+            marker = work / "latency-on"
+            marker.write_text("1\n")
+            run("mcopy", "-o", "-i", fat, marker, "::o9irc-latency-on")
         run("mcopy", "-o", "-i", fat, riostart, "::o9irc/riostart")
         original = subprocess.check_output(["mtype", "-i", fat, "::plan9.ini"])
         ini = work / "plan9.ini"
@@ -458,6 +463,12 @@ window -miny 130
                 hmp(sock, "sendkey esc")
         finally:
             stop(proc)
+        if os.environ.get("O9IRC_LATENCY") == "1":
+            log = subprocess.run(["mtype", "-i", fat, "::o9irc-latency"],
+                                 capture_output=True, text=True).stdout
+            for line in log.splitlines():
+                if "O9LAT" in line:
+                    print(line)
     print("O9IRC MOUSE PASS: channel and private views, nick input, scrollback, snarf copy, Rio menu")
 
 

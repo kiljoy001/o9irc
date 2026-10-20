@@ -64,7 +64,14 @@ function IrcHistoryIndexSaveRaw(string path, string content) bool {
         if(name != nil && n >= 0 && n <= 16384){
             fd = create(name, OWRITE|OTRUNC, 0600);
             if(fd >= 0){
-                out = write(fd, o9_string_data(content), n) == n;
+                vlong done = 0;
+                while(done < n){
+                    vlong wrote = write(fd, o9_string_data(content) + done, n - done);
+                    if(wrote <= 0)
+                        break;
+                    done += wrote;
+                }
+                out = done == n;
                 close(fd);
             }
         }
@@ -132,7 +139,10 @@ function IrcHistoryLoadRaw(string path) string {
                         if(got == size && memcmp(packed, "O9H1", 4) == 0 &&
                            ((packed[8]<<8) | packed[9]) % 31 == 0 &&
                            (packed[8] & 15) == 8 && (packed[8] & 0xF0) <= 0x70){
-                            rawsize = packed[4] | packed[5]<<8 | packed[6]<<16 | packed[7]<<24;
+                            rawsize = (ulong)packed[4] |
+                                ((ulong)packed[5]<<8) |
+                                ((ulong)packed[6]<<16) |
+                                ((ulong)packed[7]<<24);
                             if(rawsize > 0 && rawsize <= 8*1048576){
                                 plain = malloc(rawsize);
                                 if(plain != nil){
@@ -205,7 +215,14 @@ function IrcHistorySaveRaw(string path, string content, int64 maximum) int64 {
                             packed[7] = rawsize >> 24;
                             fd = create(name, OWRITE|OTRUNC, 0600);
                             if(fd >= 0){
-                                if(write(fd, packed, size) == size)
+                                vlong done = 0;
+                                while(done < size){
+                                    vlong wrote = write(fd, packed + done, size - done);
+                                    if(wrote <= 0)
+                                        break;
+                                    done += wrote;
+                                }
+                                if(done == size)
                                     out = 1;
                                 close(fd);
                             }
