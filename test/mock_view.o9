@@ -60,6 +60,8 @@ class MockViews {
         root.dir("networks");
         root.dir("networks/default");
         root.live("networks/default/input", true);
+        root.live("networks.list", false);
+        root.live("selected", true);
         MountTable mounts = new MountTable();
         mounts.view("networks/default", "o9irc.mock.network", 1);
         root.apply(mounts);
@@ -68,11 +70,19 @@ class MockViews {
     }
 
     internal method string readText(string id, string path) {
+        if(cmp(path, "networks.list") == 0) {
+            return "default\tDefault mock\tmock\tconnected\n";
+        }
+        if(cmp(path, "selected") == 0) {
+            return "default\n";
+        }
         return "";
     }
 
     internal method int64 writeText(string id, string path, int64 offset, string text, bool truncate) {
-        if(cmp(path, "networks/default/input") != 0 || offset != 0) {
+        if(offset != 0) { return -1; }
+        if(cmp(path, "selected") == 0) { return len(text); }
+        if(cmp(path, "networks/default/input") != 0) {
             return -1;
         }
         return network.command(text);

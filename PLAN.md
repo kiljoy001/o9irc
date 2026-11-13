@@ -76,6 +76,15 @@ optional attempt cap (`o9ircmaxattempts`); `connect`, `disconnect`, and
 channel set. The watchdog pings after 60 seconds of silence and drops a link
 after 120 seconds without data.
 
+Phase 3 has started with the registry decision resolved in favor of one
+service. The service creates eight fixed network slots, keeps
+`/view/networks/default` as a permanent alias, gives each network its own
+history directory and profile, and exposes `networks.list`, `selected`, and a
+`network` control file for add/remove/rename/select. The GUI follows the
+selected network and adds next/add/remove/connect/disconnect actions. Still
+open: true dynamic network ids, a network root per network in the left tree,
+two-server and migration tests, and the FileTree concurrency spike.
+
 ---
 
 ## Phase 1 - Protocol state and command surface (P0)

@@ -196,6 +196,19 @@ main {
     print("backoff2=", bo2.take(), "\n");
     Task<int64> bo3 = spawn IrcBackoffNextRaw(60);
     print("backoff3=", bo3.take(), "\n");
+    Task<string> slug0 = spawn IrcSlugRaw("irc.libera.chat:6697");
+    print("slug0=<", slug0.take(), ">\n");
+    Task<string> slug1 = spawn IrcSlugRaw("");
+    print("slug1=<", slug1.take(), ">\n");
+    string nettable = "default\tDefault\tmock\tconnected\nslot1\tLibera\tirc.libera.chat\tconnected\n";
+    Task<string> nf0 = spawn IrcUiNetworkFieldRaw(nettable, "default", 1);
+    print("netfield0=<", nf0.take(), ">\n");
+    Task<string> nf1 = spawn IrcUiNetworkFieldRaw(nettable, "slot1", 2);
+    print("netfield1=<", nf1.take(), ">\n");
+    Task<string> nn0 = spawn IrcUiNextNetworkRaw(nettable, "default");
+    print("netnext0=<", nn0.take(), ">\n");
+    Task<string> nn1 = spawn IrcUiNextNetworkRaw(nettable, "slot1");
+    print("netnext1=<", nn1.take(), ">\n");
 
     // History limit parsing, drop policy, and a zlib roundtrip.
     Task<int64> hl0 = spawn IrcHistoryLimitRaw("0");

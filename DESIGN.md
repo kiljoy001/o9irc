@@ -28,6 +28,9 @@ supervisor owns exactly one socket at a time and closes it before a redial.
 
 ```text
 /srv/ircfs
+  /view/network       write: add | remove | rename | select
+  /view/networks.list read: id<TAB>name<TAB>address<TAB>status
+  /view/selected      read/write: selected network id
   /view/networks/default/
     status    read: disconnected | connecting | connected | reconnecting | closed
     lasterror read: the most recent connection failure
@@ -48,7 +51,16 @@ supervisor owns exactly one socket at a time and closes it before a redial.
     topic, topicsetter, nicks, modes, transcript, historypath, historystatus
               legacy selected-channel aliases
     input     write: one command per write
+    connect, disconnect write: control this network
 ```
+
+`/view/networks/` also exposes `slot1` through `slot7` as fixed registry
+slots. Unused slots are mounted but do not appear in `networks.list`; adding a
+network configures the next free slot. This avoids changing a mounted
+FileTree's directory list at runtime. `networks.list` and `selected` are live
+files, so clients see adds, removes, and selection changes without remounting.
+`/view/networks/default` is a permanent alias for the legacy network and is
+never removable.
 
 `nicks` is rendered from the live member set, with membership prefixes
 attached (`@alice`, `+bob`, `@+carol`). JOIN, PART, QUIT, KICK, NICK, and
@@ -80,8 +92,10 @@ limit applies to compressed bytes. Older complete lines are evicted when the
 limit is reached. Outgoing message bodies are split into multiple frames at
 UTF-8 boundaries when they exceed the 512-byte IRC limit. The conversation
 count defaults to 256 and is read once from `o9ircmaxconversations`.
-The GUI reads the plain text `statuslog` and selected
-conversation view, and keeps separate scroll positions for each. Its selection
+The GUI reads `networks.list`, follows `selected`, and rebinds its base path
+to `networks/<id>` when the selection changes. The network menu offers next,
+add, remove, connect, and disconnect; the status line shows the active network
+name. Conversation scroll positions remain local to each GUI. Its selection
 is local to each GUI, while the IRC data and commands stay in 9P. Monotonic
 event IDs are a future addition for clients that need lossless polling.
 

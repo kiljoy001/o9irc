@@ -165,6 +165,127 @@ function IrcUiProfileCommandRaw(bool connectNow, string host, string port,
     return out;
 }
 
+
+function IrcUiAddCommandRaw(string host, string port, string nick,
+                            string channel, string realName, bool tls,
+                            string trustPath) string {
+    string out;
+    c {
+        char buf[900];
+        int n;
+
+        n = snprint(buf, sizeof buf, "add\t%.*s\t%.*s\t%.*s\t%.*s\t%.*s\t%s\t%.*s\n",
+            (int)o9_string_len(host), o9_string_data(host),
+            (int)o9_string_len(port), o9_string_data(port),
+            (int)o9_string_len(nick), o9_string_data(nick),
+            (int)o9_string_len(channel), o9_string_data(channel),
+            (int)o9_string_len(realName), o9_string_data(realName),
+            tls ? "tls" : "tcp",
+            (int)o9_string_len(trustPath), o9_string_data(trustPath));
+        out = n < sizeof buf-1 ? o9_string_new(buf, n) : o9_string_from_c("");
+    }
+    return out;
+}
+
+// Return one field from the line whose first field is `id`.
+function IrcUiNetworkFieldRaw(string table, string id, int64 field) string {
+    string out;
+    c {
+        uchar *p, *end, *line, *stop, *seg, *fend;
+        vlong nn, f, nf, i;
+        int match, x, y;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(table);
+        end = p + o9_string_len(table);
+        nn = o9_string_len(id);
+        line = p;
+        while(line < end){
+            stop = memchr(line, '\n', end - line);
+            if(stop == nil)
+                stop = end;
+            fend = memchr(line, '\t', stop - line);
+            if(fend == nil)
+                fend = stop;
+            match = fend - line == nn;
+            for(i = 0; match && i < nn; i++)
+                if(line[i] != ((uchar*)o9_string_data(id))[i])
+                    match = 0;
+            if(match){
+                nf = 1;
+                for(seg = line; seg < stop; seg++)
+                    if(*seg == '\t')
+                        nf++;
+                if(field < nf){
+                    seg = line;
+                    for(f = 0; f < field; f++){
+                        fend = memchr(seg, '\t', stop - seg);
+                        if(fend == nil)
+                            break;
+                        seg = fend + 1;
+                    }
+                    fend = memchr(seg, '\t', stop - seg);
+                    if(fend == nil)
+                        fend = stop;
+                    o9_string_release(out);
+                    out = o9_string_new((char*)seg, fend - seg);
+                }
+                break;
+            }
+            line = stop < end ? stop + 1 : end;
+        }
+        USED(x); USED(y);
+    }
+    return out;
+}
+
+// Return the id after `current` in the network table, or the first id when
+// `current` is last or missing.
+function IrcUiNextNetworkRaw(string table, string current) string {
+    string out;
+    c {
+        uchar *p, *end, *line, *stop, *first, *firstEnd, *tab, *fieldEnd;
+        vlong flen;
+        int matched;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(table);
+        end = p + o9_string_len(table);
+        first = nil;
+        firstEnd = nil;
+        matched = 0;
+        line = p;
+        while(line < end){
+            stop = memchr(line, '\n', end - line);
+            if(stop == nil)
+                stop = end;
+            if(stop > line){
+                tab = memchr(line, '\t', stop - line);
+                fieldEnd = tab != nil ? tab : stop;
+                if(first == nil){
+                    first = line;
+                    firstEnd = fieldEnd;
+                }
+                if(matched){
+                    o9_string_release(out);
+                    out = o9_string_new((char*)line, fieldEnd - line);
+                    break;
+                }
+                flen = fieldEnd - line;
+                if(flen == o9_string_len(current) &&
+                   memcmp(line, o9_string_data(current), flen) == 0)
+                    matched = 1;
+            }
+            line = stop < end ? stop + 1 : end;
+        }
+        if(o9_string_len(out) == 0 && first != nil){
+            o9_string_release(out);
+            out = o9_string_new((char*)first, firstEnd - first);
+        }
+    }
+    return out;
+}
+
 function IrcUiPanel(int64 canvas, int64 x, int64 y, int64 width, int64 height, int64 color) int64 {
     use { draw }
     int64 out;
@@ -1326,6 +1447,7 @@ class IrcSetup {
     prop bool loaded;
     prop bool shown;
     prop bool mouseDown;
+    prop bool adding;
     prop int64 focus;
 
     method IrcSetup() {
@@ -1341,6 +1463,7 @@ class IrcSetup {
         loaded = false;
         shown = false;
         mouseDown = false;
+        adding = false;
         focus = 0;
     }
 
@@ -1348,6 +1471,14 @@ class IrcSetup {
 
     method void show() {
         opened = true;
+        adding = false;
+        focus = 0;
+        feedback = "";
+    }
+
+    method void showAdd() {
+        opened = true;
+        adding = true;
         focus = 0;
         feedback = "";
     }
@@ -1401,8 +1532,14 @@ class IrcSetup {
             feedback = "Choose a trusted-keys file before enabling TLS.";
             return false;
         }
-        Task<string> profileCommand = spawn IrcUiProfileCommandRaw(
-            connectNow, host, port, nick, channel, realName, tls, trustPath);
+        Task<string> profileCommand;
+        if(adding) {
+            profileCommand = spawn IrcUiAddCommandRaw(host, port, nick, channel,
+                                                     realName, tls, trustPath);
+        } else {
+            profileCommand = spawn IrcUiProfileCommandRaw(
+                connectNow, host, port, nick, channel, realName, tls, trustPath);
+        }
         string command = profileCommand.take();
         if(len(command) == 0) {
             feedback = "Settings are too long.";
@@ -1561,7 +1698,13 @@ function IrcUiRun() int64 {
         Task<string> arg = spawn ProcessArgRaw(2);
         mountPoint = arg.take();
     }
-    string base = cat(mountPoint, "/view/networks/default/");
+    string selectedNetwork = "default";
+    string pendingNetwork = "";
+    string networks = "";
+    string base = cat(cat(cat(mountPoint, "/view/networks/"), selectedNetwork), "/");
+    string networksListPath = cat(mountPoint, "/view/networks.list");
+    string networkInputPath = cat(mountPoint, "/view/network");
+    string selectedPath = cat(mountPoint, "/view/selected");
     Task<int64> opened = spawn DrawCanvasOpenRaw("o9irc", 960, 660);
     int64 canvas = opened.take();
     if(canvas <= 0) {
@@ -1651,7 +1794,9 @@ function IrcUiRun() int64 {
                     }
                 }
                 if(kind == 1 && setupWasOpen) {
-                    if(setup.mouse(eventCode, width, height, inputPath)) {
+                    string setupPath = inputPath;
+                    if(setup.adding) { setupPath = networkInputPath; }
+                    if(setup.mouse(eventCode, width, height, setupPath)) {
                         if(setup.visible()) { setupDirty = true; }
                         else { dirty = true; }
                     }
@@ -1717,7 +1862,7 @@ function IrcUiRun() int64 {
                         if(contextClick) { button = 3; }
                         Task<int64> picked = spawn DrawMenuHitRaw(canvas, button, x, y, buttons, 8,
                             "connection setup", "status view", "join channel", "change nick",
-                            "message nick", "quit IRC", "close window", "copy selection");
+                            "message nick", "quit IRC", "network...", "copy selection");
                         int64 choice = picked.take();
                         if(choice == 0) {
                             setup.show();
@@ -1748,7 +1893,41 @@ function IrcUiRun() int64 {
                             }
                             dirty = true;
                         } else if(choice == 6) {
-                            running = false;
+                            Task<int64> networkPicked = spawn DrawMenuHitRaw(canvas, button,
+                                x, y, buttons, 6, "next network", "add network",
+                                "remove network", "connect", "disconnect", "cancel",
+                                "", "");
+                            int64 networkChoice = networkPicked.take();
+                            if(networkChoice == 0) {
+                                Task<string> nextNetwork = spawn IrcUiNextNetworkRaw(networks,
+                                                                                    selectedNetwork);
+                                string nextId = nextNetwork.take();
+                                if(len(nextId) > 0 && cmp(nextId, selectedNetwork) != 0) {
+                                    pendingNetwork.dispose();
+                                    pendingNetwork = cat(nextId, "");
+                                }
+                                nextId.dispose();
+                            } else if(networkChoice == 1) {
+                                setup.showAdd();
+                                setupDirty = true;
+                            } else if(networkChoice == 2) {
+                                string removeCommand = cat(cat("remove\t", selectedNetwork), "\n");
+                                Task<int64> removed = spawn IrcUiWriteInputRaw(networkInputPath,
+                                                                              removeCommand);
+                                if(removed.take() < 0) {
+                                    connection.dispose();
+                                    connection = "network removal rejected";
+                                }
+                                removeCommand.dispose();
+                            } else if(networkChoice == 3) {
+                                Task<int64> connected = spawn IrcUiWriteInputRaw(inputPath,
+                                                                                "connect\n");
+                                connected.take();
+                            } else if(networkChoice == 4) {
+                                Task<int64> disconnected = spawn IrcUiWriteInputRaw(inputPath,
+                                                                                   "disconnect\n");
+                                disconnected.take();
+                            }
                         } else if(choice == 7) {
                             copySelected = true;
                         }
@@ -1929,6 +2108,81 @@ function IrcUiRun() int64 {
             } else {
                 nextConversations.dispose();
             }
+            string nextNetworks = readfile(networksListPath);
+            if(cmp(nextNetworks, networks) != 0) {
+                networks.dispose();
+                networks = nextNetworks;
+                Task<int64> networkCount = spawn StringCountRaw(networks, "\n");
+                int64 networkRows = networkCount.take();
+                bool foundNetwork = false;
+                string firstNetwork = "";
+                int64 networkRow = 0;
+                while(networkRow < networkRows) {
+                    Task<string> field = spawn StringFieldRaw(networks, "\n", networkRow);
+                    string networkId = field.take();
+                    if(len(networkId) > 0) {
+                        if(len(firstNetwork) == 0) { firstNetwork = cat(networkId, ""); }
+                        if(cmp(networkId, selectedNetwork) == 0) { foundNetwork = true; }
+                    }
+                    networkId.dispose();
+                    networkRow = networkRow + 1;
+                }
+                if(!foundNetwork && len(firstNetwork) > 0) {
+                    pendingNetwork.dispose();
+                    pendingNetwork = cat(firstNetwork, "");
+                }
+                firstNetwork.dispose();
+                dirty = true;
+            } else {
+                nextNetworks.dispose();
+            }
+            string nextSelected = readfile(selectedPath);
+            Task<string> trimmedSelected = spawn StringTrimRaw(nextSelected);
+            string chosenNetwork = trimmedSelected.take();
+            nextSelected.dispose();
+            if(len(chosenNetwork) > 0 && cmp(chosenNetwork, selectedNetwork) != 0) {
+                pendingNetwork.dispose();
+                pendingNetwork = cat(chosenNetwork, "");
+            }
+            chosenNetwork.dispose();
+            if(len(pendingNetwork) > 0 && cmp(pendingNetwork, selectedNetwork) != 0) {
+                selectedNetwork.dispose();
+                selectedNetwork = cat(pendingNetwork, "");
+                base.dispose();
+                base = cat(cat(cat(mountPoint, "/view/networks/"), selectedNetwork), "/");
+                statusPath.dispose(); statusPath = cat(base, "status");
+                channelPath.dispose(); channelPath = cat(base, "channel");
+                conversationsPath.dispose(); conversationsPath = cat(base, "conversations");
+                topicPath.dispose(); topicPath = cat(base, "topic");
+                transcriptPath.dispose(); transcriptPath = cat(base, "transcript");
+                statuslogPath.dispose(); statuslogPath = cat(base, "statuslog");
+                eventsPath.dispose(); eventsPath = cat(base, "events");
+                nicksPath.dispose(); nicksPath = cat(base, "nicks");
+                inputPath.dispose(); inputPath = cat(base, "input");
+                profilePath.dispose(); profilePath = cat(base, "profile");
+                conversations.dispose(); conversations = "";
+                selectedKey.dispose(); selectedKey = "";
+                selectedName.dispose(); selectedName = "";
+                activePathKey.dispose(); activePathKey = "";
+                channel.dispose(); channel = "";
+                topic.dispose(); topic = "";
+                transcript.dispose(); transcript = "";
+                statuslog.dispose(); statuslog = "";
+                nicks.dispose(); nicks = "";
+                statusView = false;
+                channelBack = 0;
+                statusBack = 0;
+                setup.loaded = false;
+                basePainted = false;
+                dirty = true;
+                string selectCommand = cat(cat("select\t", selectedNetwork), "\n");
+                Task<int64> selectedWrite = spawn IrcUiWriteInputRaw(networkInputPath,
+                                                                    selectCommand);
+                selectedWrite.take();
+                selectCommand.dispose();
+                pendingNetwork.dispose();
+                pendingNetwork = "";
+            }
             if(cmp(activePathKey, selectedKey) != 0) {
                 activePathKey.dispose(); topicPath.dispose(); transcriptPath.dispose(); nicksPath.dispose();
                 activePathKey = cat(selectedKey, "");
@@ -2001,13 +2255,23 @@ function IrcUiRun() int64 {
             if(dirty && (!setup.visible() || !basePainted)) {
                 int64 scrollBack = channelBack;
                 if(statusView) { scrollBack = statusBack; }
-                Task<int64> painted = spawn IrcUiPaint(canvas, width, height, connection, channel,
+                Task<string> networkNameTask = spawn IrcUiNetworkFieldRaw(networks,
+                                                                         selectedNetwork, 1);
+                string networkName = networkNameTask.take();
+                if(len(networkName) == 0) {
+                    networkName.dispose();
+                    networkName = cat(selectedNetwork, "");
+                }
+                string shownConnection = cat(cat(cat("[", networkName), "] "), connection);
+                Task<int64> painted = spawn IrcUiPaint(canvas, width, height, shownConnection, channel,
                                                          topic, transcript, statuslog, nicks, input,
                                                          conversations, selectedKey,
                                                          statusView, scrollBack, labelTick,
                                                          selectionStart, selectionEnd,
                                                          !setup.visible());
                 labelsScrolling = painted.take() != 0;
+                shownConnection.dispose();
+                networkName.dispose();
                 if(setup.visible()) { setup.paint(canvas, width, height); }
                 basePainted = true;
                 dirty = false;
@@ -2035,7 +2299,7 @@ function IrcUiRun() int64 {
             }
         }
         Task<int64> closed = spawn DrawCanvasCloseRaw(canvas);
-        closed.take(); statusPath.dispose(); channelPath.dispose(); conversationsPath.dispose(); topicPath.dispose(); transcriptPath.dispose(); statuslogPath.dispose(); eventsPath.dispose(); nicksPath.dispose(); inputPath.dispose(); profilePath.dispose(); connection.dispose(); channel.dispose(); topic.dispose(); transcript.dispose(); statuslog.dispose(); nicks.dispose(); input.dispose(); conversations.dispose(); selectedKey.dispose(); selectedName.dispose(); activePathKey.dispose(); base.dispose(); mountPoint.dispose();
+        closed.take(); statusPath.dispose(); channelPath.dispose(); conversationsPath.dispose(); topicPath.dispose(); transcriptPath.dispose(); statuslogPath.dispose(); eventsPath.dispose(); nicksPath.dispose(); inputPath.dispose(); profilePath.dispose(); connection.dispose(); channel.dispose(); topic.dispose(); transcript.dispose(); statuslog.dispose(); nicks.dispose(); input.dispose(); conversations.dispose(); selectedKey.dispose(); selectedName.dispose(); activePathKey.dispose(); base.dispose(); networks.dispose(); selectedNetwork.dispose(); pendingNetwork.dispose(); networksListPath.dispose(); networkInputPath.dispose(); selectedPath.dispose(); mountPoint.dispose();
     }
     return 0;
 }

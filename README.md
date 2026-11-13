@@ -135,7 +135,16 @@ o9irc-start 'tcp!irc.example.net!6667' nickname '#channel'
 These settings take effect when a new service starts; an already running
 service keeps its current settings. History files are private to the 9front
 user and the GUI never reads the compressed format directly.
-It currently shows one network. The number of channels and private
+The service hosts up to eight networks in fixed slots. `/view/networks/default`
+is the legacy network and is permanent; the remaining slots appear in
+`/view/networks.list` only when configured. Write `add<TAB>host<TAB>port<TAB>nick<TAB>channel<TAB>name<TAB>transport<TAB>trust`
+to `/view/network` to configure the next slot, `remove<TAB>id` to stop and hide
+one, `rename<TAB>id<TAB>name`, or `select<TAB>id`. `/view/selected` is readable
+and writable, so a client can follow another client's selection. In the GUI,
+the native menu's **network...** entry offers next, add, remove, connect, and
+disconnect; the status line shows the active network name.
+
+The number of channels and private
 conversations defaults to 256 and can be set with
 `o9ircmaxconversations` (1 through 1024) before starting the service.
 The outbound pacer sends two lines per second with a burst of five by default;

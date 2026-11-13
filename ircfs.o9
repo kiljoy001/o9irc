@@ -302,6 +302,8 @@ function IrcDialTLSRaw(string address, string host, string trustPath) string {
 
 class IrcNetwork {
     private FileTree files;
+    private string identifier;
+    private string displayName;
     private string fd;
     private string channel;
     private string activeKey;
@@ -322,6 +324,7 @@ class IrcNetwork {
     private int64 lastIncomingSec;
     private int64 lastPingSec;
     private string lastError;
+    private string statusText;
     private string events;
     private string statuslog;
     private string address;
@@ -358,9 +361,11 @@ class IrcNetwork {
     private Dict<string,string> historyWritable;
     private Dict<string,string> namesReceiving;
 
-    method IrcNetwork(string firstChannel, string initialNick, string server,
-                      string directory, int64 maximum) {
+    method IrcNetwork(string id, string firstChannel, string initialNick,
+                      string server, string directory, int64 maximum) {
         files = new FileTree();
+        identifier = cat(id, "");
+        displayName = cat(id, "");
         files.text("status", "disconnected\n", false);
         files.text("lasterror", "", false);
         files.text("nextattempt", "0\n", false);
@@ -389,7 +394,8 @@ class IrcNetwork {
             profile = "\t6667\t\t\t";
         }
         files.text("profile", profile, false);
-        files.register("o9irc.network.default");
+        files.text("name", cat(identifier, "\n"), false);
+        files.register(cat("o9irc.network.", identifier));
         fd = "";
         channel = "";
         activeKey = "";
@@ -410,6 +416,7 @@ class IrcNetwork {
         lastIncomingSec = 0;
         lastPingSec = 0;
         lastError = "";
+        statusText = "disconnected";
         events = "";
         statuslog = "";
         address = server;
@@ -1192,6 +1199,8 @@ class IrcNetwork {
     }
 
     internal method void writeStatus(string value) {
+        statusText.dispose();
+        statusText = cat(value, "");
         files.text("status", cat(value, "\n"), false);
     }
 
@@ -1412,6 +1421,33 @@ class IrcNetwork {
         shutDownService();
     }
 
+    internal method void loadStoredProfile() {
+        Task<string> saved = spawn IrcProfileLoadRaw(profilePath);
+        string value = saved.take();
+        Task<bool> valid = spawn IrcProfileValidRaw(value);
+        if(valid.take()) {
+            configure(value, false);
+        }
+        value.dispose();
+    }
+
+    internal method string networkId() { return cat(identifier, ""); }
+    internal method string networkStatus() { return cat(statusText, ""); }
+    internal method void markRemoved() {
+        shuttingDown = true;
+        wantConnected = false;
+        generation = generation + 1;
+        closeSocket();
+        writeStatus("removed");
+        publishNextAttempt(0);
+    }
+    internal method string networkName() { return cat(displayName, ""); }
+    internal method void setNetworkName(string value) {
+        displayName.dispose();
+        displayName = cat(value, "");
+        files.text("name", cat(value, "\n"), false);
+    }
+
     internal method string connectionAddress() { return cat(address, ""); }
     internal method string connectionNick() { return cat(nick, ""); }
     internal method string connectionName() { return cat(realName, ""); }
@@ -1435,7 +1471,7 @@ class IrcNetwork {
         Task<bool> saved = spawn IrcProfileSaveRaw(profilePath, value);
         if(!saved.take()) { return false; }
         files.text("profile", value, false);
-        if(!connectNow) { return true; }
+        if(!connectNow && linkUp) { return true; }
         Task<string> hostPart = spawn StringFieldRaw(value, "\t", 0);
         Task<string> portPart = spawn StringFieldRaw(value, "\t", 1);
         Task<string> nickPart = spawn StringFieldRaw(value, "\t", 2);
@@ -1483,13 +1519,15 @@ class IrcNetwork {
         }
         registered = false;
         nickFallbacks = 0;
-        shuttingDown = false;
-        wantConnected = true;
-        attempt = 0;
-        backoffSec = 1;
-        nextAttemptSec = 0;
-        publishNextAttempt(0);
-        writeStatus("connecting");
+        if(connectNow) {
+            shuttingDown = false;
+            wantConnected = true;
+            attempt = 0;
+            backoffSec = 1;
+            nextAttemptSec = 0;
+            publishNextAttempt(0);
+            writeStatus("connecting");
+        }
         if(len(nextChannel) > 0) {
             Task<bool> validChannel = spawn IrcValidTargetRaw(nextChannel);
             Task<bool> isChannel = spawn IrcIsChannelRaw(nextChannel);
@@ -2536,8 +2574,8 @@ class IrcNetwork {
     }
 }
 
-function IrcWatchdog(int64 gen) int64 {
-    IrcNetwork network = lookup("network");
+function IrcWatchdog(string slot, int64 gen) int64 {
+    IrcNetwork network = lookup(slot);
     while(true) {
         Task<int64> slept = spawn IrcSleepRaw(5000);
         slept.take();
@@ -2546,8 +2584,8 @@ function IrcWatchdog(int64 gen) int64 {
     }
 }
 
-function IrcPump(string fd, int64 gen) int64 {
-    IrcNetwork network = lookup("network");
+function IrcPump(string slot, string fd, int64 gen) int64 {
+    IrcNetwork network = lookup(slot);
     while(true) {
         Task<string> read = spawn IrcReadLineRaw(fd, gen);
         string line = read.take();
@@ -2565,8 +2603,8 @@ function IrcPump(string fd, int64 gen) int64 {
 // One supervisor owns dial, registration, the read loop, the ping watchdog,
 // and teardown. It never exits while the service runs; connect, disconnect,
 // and reconnect are requests handled between attempts.
-function IrcSupervise() int64 {
-    IrcNetwork network = lookup("network");
+function IrcSupervise(string slot) int64 {
+    IrcNetwork network = lookup(slot);
     while(true) {
         if(!network.wantsConnection()) {
             Task<int64> idle = spawn IrcSleepRaw(500);
@@ -2613,8 +2651,8 @@ function IrcSupervise() int64 {
                 if(!nickSent || !userSent) {
                     network.linkLost(gen, "registration write failed");
                 } else {
-                    Task<int64> watchdog = spawn IrcWatchdog(gen);
-                    Task<int64> reader = spawn IrcPump(fd, gen);
+                    Task<int64> watchdog = spawn IrcWatchdog(slot, gen);
+                    Task<int64> reader = spawn IrcPump(slot, fd, gen);
                     reader.take();
                     watchdog.take();
                 }
@@ -2632,32 +2670,438 @@ function IrcSupervise() int64 {
 
 class IrcViews {
     ViewController;
-    private IrcNetwork network;
+    private Dict<string,IrcNetwork> pool;
+    private Dict<string,IrcNetwork> networks;
+    private Dict<string,string> names;
+    private Dict<string,string> used;
+    private Dict<string,string> removed;
+    private Dict<string,string> supervised;
+    private string slotTable;
+    private string order;
+    private string selected;
+    private string historyRoot;
+    private string indexPath;
+    private int64 historyLimit;
 
-    method IrcViews(IrcNetwork model) {
-        network = model;
+    method IrcViews(IrcNetwork net0, IrcNetwork net1, IrcNetwork net2,
+                    IrcNetwork net3, IrcNetwork net4, IrcNetwork net5,
+                    IrcNetwork net6, IrcNetwork net7, string root,
+                    string firstChannel, string initialNick, string server,
+                    string transport, string host, string trust, int64 limit) {
+        pool["network0"] = net0;
+        pool["network1"] = net1;
+        pool["network2"] = net2;
+        pool["network3"] = net3;
+        pool["network4"] = net4;
+        pool["network5"] = net5;
+        pool["network6"] = net6;
+        pool["network7"] = net7;
+        historyRoot = cat(root, "");
+        indexPath = cat(historyRoot, "/networks.index");
+        historyLimit = limit;
+        slotTable = "network0\tdefault\nnetwork1\tslot1\nnetwork2\tslot2\nnetwork3\tslot3\nnetwork4\tslot4\nnetwork5\tslot5\nnetwork6\tslot6\nnetwork7\tslot7\n";
+        order = "";
+        selected = "default";
+        loadIndex();
+        Task<int64> slotsTask = spawn StringCountRaw(slotTable, "\n");
+        int64 slots = slotsTask.take();
+        int64 i = 0;
+        while(i < slots) {
+            Task<string> rowTask = spawn StringFieldRaw(slotTable, "\n", i);
+            string row = rowTask.take();
+            Task<string> idTask = spawn StringFieldRaw(row, "\t", 1);
+            string id = idTask.take();
+            if(len(id) > 0 && hasId(id)) {
+                activateExisting(id, firstChannel, initialNick, server, transport,
+                                 host, trust);
+            }
+            id.dispose();
+            row.dispose();
+            i = i + 1;
+        }
+        if(!networks.Has("default")) {
+            activateExisting("default", firstChannel, initialNick, server,
+                             transport, host, trust);
+        }
+        saveIndex();
+    }
+
+    internal method string slotForId(string id) {
+        string out = "";
+        Task<int64> rowsTask = spawn StringCountRaw(slotTable, "\n");
+        int64 rows = rowsTask.take();
+        int64 i = 0;
+        while(i < rows && len(out) == 0) {
+            Task<string> rowTask = spawn StringFieldRaw(slotTable, "\n", i);
+            string row = rowTask.take();
+            Task<string> slotTask = spawn StringFieldRaw(row, "\t", 0);
+            Task<string> idTask = spawn StringFieldRaw(row, "\t", 1);
+            string slot = slotTask.take();
+            string candidate = idTask.take();
+            if(cmp(candidate, id) == 0) { out = cat(slot, ""); }
+            slot.dispose();
+            candidate.dispose();
+            row.dispose();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    internal method string idForSlot(string slot) {
+        string out = "";
+        Task<int64> rowsTask = spawn StringCountRaw(slotTable, "\n");
+        int64 rows = rowsTask.take();
+        int64 i = 0;
+        while(i < rows && len(out) == 0) {
+            Task<string> rowTask = spawn StringFieldRaw(slotTable, "\n", i);
+            string row = rowTask.take();
+            Task<string> slotTask = spawn StringFieldRaw(row, "\t", 0);
+            Task<string> idTask = spawn StringFieldRaw(row, "\t", 1);
+            string candidate = slotTask.take();
+            string id = idTask.take();
+            if(cmp(candidate, slot) == 0) { out = cat(id, ""); }
+            candidate.dispose();
+            id.dispose();
+            row.dispose();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    internal method bool hasId(string id) {
+        bool found = false;
+        Task<int64> rowsTask = spawn StringCountRaw(order, "\n");
+        int64 rows = rowsTask.take();
+        int64 i = 0;
+        while(i < rows && !found) {
+            Task<string> field = spawn StringFieldRaw(order, "\n", i);
+            string value = field.take();
+            if(cmp(value, id) == 0) { found = true; }
+            value.dispose();
+            i = i + 1;
+        }
+        return found;
+    }
+
+    internal method void appendId(string id) {
+        if(len(id) > 0 && !hasId(id)) {
+            order = cat(order, cat(id, "\n"));
+        }
+    }
+
+    internal method void loadIndex() {
+        Task<int64> ready = spawn FileMkdirAllRaw(historyRoot);
+        ready.take();
+        Task<string> loaded = spawn IrcHistoryIndexLoadRaw(indexPath);
+        string saved = loaded.take();
+        Task<int64> rowsTask = spawn StringCountRaw(saved, "\n");
+        int64 rows = rowsTask.take();
+        int64 i = 0;
+        while(i < rows) {
+            Task<string> rowTask = spawn StringFieldRaw(saved, "\n", i);
+            string row = rowTask.take();
+            if(len(row) > 0) {
+                Task<string> idTask = spawn StringFieldRaw(row, "\t", 0);
+                Task<string> nameTask = spawn StringFieldRaw(row, "\t", 1);
+                string id = idTask.take();
+                string name = nameTask.take();
+                if(len(id) > 0) {
+                    appendId(id);
+                    if(len(name) == 0) { name = id; }
+                    names[id] = name;
+                    used[id] = "yes";
+                }
+                id.dispose();
+                name.dispose();
+            }
+            row.dispose();
+            i = i + 1;
+        }
+        saved.dispose();
+        if(!hasId("default")) {
+            appendId("default");
+            names["default"] = "default";
+            used["default"] = "yes";
+        }
+    }
+
+    internal method void saveIndex() {
+        string text = "";
+        Task<int64> rowsTask = spawn StringCountRaw(order, "\n");
+        int64 rows = rowsTask.take();
+        int64 i = 0;
+        while(i < rows) {
+            Task<string> field = spawn StringFieldRaw(order, "\n", i);
+            string id = field.take();
+            if(len(id) > 0 && used.Has(id) && cmp(used[id], "yes") == 0 &&
+               !(removed.Has(id) && cmp(removed[id], "yes") == 0)) {
+                string name = id;
+                if(names.Has(id)) { name = names[id]; }
+                string line = cat(cat(id, "\t"), cat(name, "\n"));
+                string next = cat(text, line);
+                text.dispose();
+                text = next;
+                line.dispose();
+            }
+            id.dispose();
+            i = i + 1;
+        }
+        Task<bool> saved = spawn IrcHistoryIndexSaveRaw(indexPath, text);
+        saved.take();
+        text.dispose();
+    }
+
+    internal method void activateExisting(string id, string firstChannel,
+                                          string nick, string server,
+                                          string transport, string host,
+                                          string trust) {
+        string slot = slotForId(id);
+        if(len(slot) > 0 && pool.Has(slot)) {
+            IrcNetwork net = pool[slot];
+            string display = id;
+            if(names.Has(id)) { display = names[id]; }
+            net.setNetworkName(display);
+            networks[id] = net;
+            names[id] = cat(display, "");
+            used[id] = "yes";
+            appendId(id);
+            if(cmp(id, "default") == 0 && len(server) > 0) {
+                net.applyTransport(transport, host, trust);
+                net.requestConnect();
+            } else {
+                net.loadStoredProfile();
+            }
+            if(!(supervised.Has(slot) && cmp(supervised[slot], "yes") == 0)) {
+                supervised[slot] = "yes";
+                Task<int64> supervisor = spawn IrcSupervise(slot);
+            }
+        }
+        slot.dispose();
+    }
+
+    internal method bool addNetwork(string profile) {
+        Task<bool> valid = spawn IrcProfileValidRaw(profile);
+        if(!valid.take()) { return false; }
+        Task<string> hostField = spawn StringFieldRaw(profile, "\t", 0);
+        Task<string> nameField = spawn StringFieldRaw(profile, "\t", 4);
+        string host = hostField.take();
+        string display = nameField.take();
+        if(len(display) == 0) {
+            display.dispose();
+            display = cat(host, "");
+        }
+        string chosenId = "";
+        string chosenSlot = "";
+        Task<int64> rowsTask = spawn StringCountRaw(slotTable, "\n");
+        int64 rows = rowsTask.take();
+        int64 i = 0;
+        while(i < rows && len(chosenId) == 0) {
+            Task<string> rowTask = spawn StringFieldRaw(slotTable, "\n", i);
+            string row = rowTask.take();
+            Task<string> slotTask = spawn StringFieldRaw(row, "\t", 0);
+            Task<string> idTask = spawn StringFieldRaw(row, "\t", 1);
+            string slot = slotTask.take();
+            string id = idTask.take();
+            bool busy = used.Has(id) && cmp(used[id], "yes") == 0;
+            bool everStarted = supervised.Has(id) && cmp(supervised[id], "yes") == 0;
+            if(!busy && !everStarted && len(id) > 0) {
+                chosenId = cat(id, "");
+                chosenSlot = cat(slot, "");
+                removed[id] = "no";
+            }
+            slot.dispose();
+            id.dispose();
+            row.dispose();
+            i = i + 1;
+        }
+        bool ok = false;
+        if(len(chosenId) > 0 && pool.Has(chosenSlot)) {
+            IrcNetwork net = pool[chosenSlot];
+            ok = net.configure(profile, true);
+            if(ok) {
+                net.setNetworkName(display);
+                networks[chosenId] = net;
+                names[chosenId] = cat(display, "");
+                used[chosenId] = "yes";
+                appendId(chosenId);
+                selected.dispose();
+                selected = cat(chosenId, "");
+                if(!(supervised.Has(chosenSlot) && cmp(supervised[chosenSlot], "yes") == 0)) {
+                    supervised[chosenSlot] = "yes";
+                    Task<int64> supervisor = spawn IrcSupervise(chosenSlot);
+                }
+                saveIndex();
+            }
+        } else {
+            ok = false;
+        }
+        host.dispose();
+        display.dispose();
+        chosenId.dispose();
+        chosenSlot.dispose();
+        return ok;
+    }
+
+    internal method bool removeNetwork(string id) {
+        bool ok = false;
+        if(cmp(id, "default") != 0 && networks.Has(id)) {
+            IrcNetwork net = networks[id];
+            net.markRemoved();
+            used[id] = "no";
+            removed[id] = "yes";
+            if(cmp(selected, id) == 0) {
+                selected.dispose();
+                selected = "default";
+            }
+            saveIndex();
+            ok = true;
+        }
+        return ok;
+    }
+
+    internal method bool renameNetwork(string id, string display) {
+        bool ok = false;
+        if(networks.Has(id) && len(display) > 0) {
+            IrcNetwork net = networks[id];
+            net.setNetworkName(display);
+            names[id] = cat(display, "");
+            saveIndex();
+            ok = true;
+        }
+        return ok;
+    }
+
+    internal method bool selectNetwork(string id) {
+        bool ok = false;
+        if(networks.Has(id)) {
+            selected.dispose();
+            selected = cat(id, "");
+            ok = true;
+        }
+        return ok;
+    }
+
+    internal method bool networkCommand(string input) {
+        Task<int64> add = spawn StringStartsWithRaw(input, "add\t");
+        Task<int64> remove = spawn StringStartsWithRaw(input, "remove\t");
+        Task<int64> rename = spawn StringStartsWithRaw(input, "rename\t");
+        Task<int64> select = spawn StringStartsWithRaw(input, "select\t");
+        bool ok = false;
+        if(add.take() != 0) {
+            Task<string> fields = spawn StringSliceRaw(input, 4, len(input) - 4);
+            string profile = fields.take();
+            ok = addNetwork(profile);
+            profile.dispose();
+        } else if(remove.take() != 0) {
+            Task<string> fields = spawn StringSliceRaw(input, 7, len(input) - 7);
+            string id = fields.take();
+            ok = removeNetwork(id);
+            id.dispose();
+        } else if(rename.take() != 0) {
+            Task<string> fields = spawn StringSliceRaw(input, 7, len(input) - 7);
+            string args = fields.take();
+            Task<int64> gap = spawn StringIndexOfRaw(args, "\t");
+            int64 pos = gap.take();
+            if(pos > 0) {
+                Task<string> idField = spawn StringSliceRaw(args, 0, pos);
+                Task<string> nameField = spawn StringSliceRaw(args, pos + 1,
+                                                            len(args) - pos - 1);
+                string id = idField.take();
+                string name = nameField.take();
+                ok = renameNetwork(id, name);
+                id.dispose();
+                name.dispose();
+            }
+            args.dispose();
+        } else if(select.take() != 0) {
+            Task<string> fields = spawn StringSliceRaw(input, 7, len(input) - 7);
+            string id = fields.take();
+            ok = selectNetwork(id);
+            id.dispose();
+        }
+        return ok;
     }
 
     internal method FileTree display(string id, string caller) {
         FileTree root = new FileTree();
         root.dir("networks");
-        root.dir("networks/default");
-        root.live("networks/default/input", true);
+        root.live("network", true);
+        root.live("networks.list", false);
+        root.live("selected", true);
         MountTable mounts = new MountTable();
-        mounts.view("networks/default", "o9irc.network.default", 1);
+        Task<int64> rowsTask = spawn StringCountRaw(slotTable, "\n");
+        int64 rows = rowsTask.take();
+        int64 i = 0;
+        while(i < rows) {
+            Task<string> rowTask = spawn StringFieldRaw(slotTable, "\n", i);
+            string row = rowTask.take();
+            Task<string> idTask = spawn StringFieldRaw(row, "\t", 1);
+            string networkId = idTask.take();
+            if(len(networkId) > 0) {
+                string prefix = cat("networks/", networkId);
+                root.dir(prefix);
+                root.live(cat(prefix, "/input"), true);
+                root.live(cat(prefix, "/connect"), true);
+                root.live(cat(prefix, "/disconnect"), true);
+                mounts.view(prefix, cat("o9irc.network.", networkId), 1);
+                prefix.dispose();
+            }
+            networkId.dispose();
+            row.dispose();
+            i = i + 1;
+        }
         root.apply(mounts);
         mounts.close();
         return root;
     }
 
-    internal method string readText(string id, string path) {
-        return "";
+    internal method string networkListText() {
+        string text = "";
+        Task<int64> rowsTask = spawn StringCountRaw(slotTable, "\n");
+        int64 rows = rowsTask.take();
+        int64 i = 0;
+        while(i < rows) {
+            Task<string> rowTask = spawn StringFieldRaw(slotTable, "\n", i);
+            string row = rowTask.take();
+            Task<string> idTask = spawn StringFieldRaw(row, "\t", 1);
+            string id = idTask.take();
+            if(len(id) > 0 && networks.Has(id) && used.Has(id) &&
+               cmp(used[id], "yes") == 0 &&
+               !(removed.Has(id) && cmp(removed[id], "yes") == 0)) {
+                IrcNetwork net = networks[id];
+                string name = net.networkName();
+                string address = net.connectionAddress();
+                string status = net.networkStatus();
+                string line = cat(cat(cat(id, "\t"), cat(name, "\t")),
+                                  cat(cat(address, "\t"), cat(status, "\n")));
+                string next = cat(text, line);
+                text.dispose();
+                text = next;
+                line.dispose();
+                name.dispose();
+                address.dispose();
+                status.dispose();
+            }
+            id.dispose();
+            row.dispose();
+            i = i + 1;
+        }
+        return text;
     }
 
-    internal method int64 writeText(string id, string path, int64 offset, string text, bool truncate) {
-        if(cmp(path, "networks/default/input") != 0 || offset != 0) {
-            return -1;
+    internal method string readText(string id, string path) {
+        string out = "";
+        if(cmp(path, "networks.list") == 0) {
+            out = networkListText();
+        } else if(cmp(path, "selected") == 0) {
+            out = cat(selected, "\n");
         }
+        return out;
+    }
+
+    internal method int64 writeText(string id, string path, int64 offset,
+                                    string text, bool truncate) {
+        if(offset != 0) { return -1; }
         string input = text;
         bool ownsInput = false;
         Task<int64> endsNewline = spawn StringEndsWithRaw(input, "\n");
@@ -2666,11 +3110,45 @@ class IrcViews {
             input = trimmed.take();
             ownsInput = true;
         }
-        bool accepted = network.command(input);
-        if(ownsInput) { input.dispose(); }
-        if(accepted) {
-            return len(text);
+        bool accepted = false;
+        if(cmp(path, "network") == 0) {
+            accepted = networkCommand(input);
+        } else if(cmp(path, "selected") == 0) {
+            accepted = selectNetwork(input);
+        } else {
+            Task<int64> prefix = spawn StringStartsWithRaw(path, "networks/");
+            if(prefix.take() != 0) {
+                Task<string> restTask = spawn StringSliceRaw(path, 9,
+                                                             len(path) - 9);
+                string rest = restTask.take();
+                Task<int64> slash = spawn StringIndexOfRaw(rest, "/");
+                int64 pos = slash.take();
+                if(pos > 0) {
+                    Task<string> idTask = spawn StringSliceRaw(rest, 0, pos);
+                    Task<string> leafTask = spawn StringSliceRaw(rest, pos + 1,
+                                                                len(rest) - pos - 1);
+                    string networkId = idTask.take();
+                    string leaf = leafTask.take();
+                    if(networks.Has(networkId)) {
+                        IrcNetwork net = networks[networkId];
+                        if(cmp(leaf, "input") == 0) {
+                            accepted = net.command(input);
+                        } else if(cmp(leaf, "connect") == 0) {
+                            net.requestConnect();
+                            accepted = true;
+                        } else if(cmp(leaf, "disconnect") == 0) {
+                            net.requestDisconnect();
+                            accepted = true;
+                        }
+                    }
+                    networkId.dispose();
+                    leaf.dispose();
+                }
+                rest.dispose();
+            }
         }
+        if(ownsInput) { input.dispose(); }
+        if(accepted) { return len(text); }
         return -1;
     }
 }
@@ -2724,14 +3202,30 @@ main {
             }
         }
         Task<int64> limit = spawn IrcHistoryLimitRaw(limitArg);
-        IrcNetwork network = new IrcNetwork(channel, nick, address, historyDirectory, limit.take());
-        network.applyTransport(transport, serverName, trustFile);
-        if(len(address) > 0) { network.requestConnect(); }
-        IrcViews views = new IrcViews(network);
+        int64 historyLimit = limit.take();
+        string slotRoot = cat(historyDirectory, "/networks");
+        IrcNetwork network0 = new IrcNetwork("default", channel, nick, address,
+                                             historyDirectory, historyLimit);
+        IrcNetwork network1 = new IrcNetwork("slot1", "", "", "",
+            cat(slotRoot, "/slot1"), historyLimit);
+        IrcNetwork network2 = new IrcNetwork("slot2", "", "", "",
+            cat(slotRoot, "/slot2"), historyLimit);
+        IrcNetwork network3 = new IrcNetwork("slot3", "", "", "",
+            cat(slotRoot, "/slot3"), historyLimit);
+        IrcNetwork network4 = new IrcNetwork("slot4", "", "", "",
+            cat(slotRoot, "/slot4"), historyLimit);
+        IrcNetwork network5 = new IrcNetwork("slot5", "", "", "",
+            cat(slotRoot, "/slot5"), historyLimit);
+        IrcNetwork network6 = new IrcNetwork("slot6", "", "", "",
+            cat(slotRoot, "/slot6"), historyLimit);
+        IrcNetwork network7 = new IrcNetwork("slot7", "", "", "",
+            cat(slotRoot, "/slot7"), historyLimit);
+        IrcViews views = new IrcViews(network0, network1, network2, network3,
+                                      network4, network5, network6, network7,
+                                      historyDirectory, channel, nick, address,
+                                      transport, serverName, trustFile,
+                                      historyLimit);
         viewController(views);
-        if(network.claimSupervisor()) {
-            Task<int64> supervisor = spawn IrcSupervise();
-        }
         serve();
     }
 }
