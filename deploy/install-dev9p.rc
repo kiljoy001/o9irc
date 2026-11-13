@@ -11,7 +11,7 @@ if(! test -d $out)
 	mkdir $out
 if(! test -d $out)
 	exit mkdir
-for(f in irc.o9 ircfs.o9 gui.o9 protocol.o9 history.o9 uiio.o9){
+for(f in irc.o9 ircfs.o9 gui.o9 protocol.o9 state.o9 history.o9 uiio.o9){
 	if(! cp $source/$f $out/$f)
 		exit copy
 }

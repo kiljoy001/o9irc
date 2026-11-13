@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 # Files that must not leave a task handle open.
-TAKE_ONLY = ("irc.o9", "ircfs.o9", "protocol.o9", "history.o9", "uiio.o9")
+TAKE_ONLY = ("irc.o9", "ircfs.o9", "protocol.o9", "state.o9", "history.o9", "uiio.o9")
 # GUI awaits are allowed only when the same task is closed shortly after.
 GUI_WINDOW = 24
 

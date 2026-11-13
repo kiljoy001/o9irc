@@ -2,6 +2,7 @@
 // with objective-9c's host runtime (see host_logic.py).
 import "string.o9";
 import "protocol.o9";
+import "state.o9";
 import "history.o9";
 import "file.o9";
 import "gui.o9";
@@ -76,6 +77,111 @@ main {
     print("nick9=<", n9.take(), ">\n");
     Task<string> pp = spawn IrcPayload("@a=b :nick!u@h PRIVMSG #c :hello");
     print("payload=<", pp.take(), ">\n");
+
+    // Channel member state: prefixes, multi-prefix NAMES, case folding.
+    string members = "";
+    Task<string> ma = spawn IrcNamesAddRaw(members, "@+alice!u@h");
+    members = ma.take();
+    Task<string> mb = spawn IrcNamesAddRaw(members, "bob");
+    members = mb.take();
+    Task<string> mc = spawn IrcNamesAddRaw(members, "carol");
+    members = mc.take();
+    Task<string> mr = spawn IrcMembersRenderRaw(members);
+    print("members=<", mr.take(), ">\n");
+    Task<int64> mf = spawn IrcMemberFindRaw(members, "ALICE");
+    print("memberfind=", mf.take(), "\n");
+    Task<int64> mn = spawn IrcMemberCountRaw(members);
+    print("membercount=", mn.take(), "\n");
+    Task<string> mp0 = spawn IrcMemberPrefixRaw(members, "alice");
+    print("memberprefix=<", mp0.take(), ">\n");
+    Task<string> mp1 = spawn IrcPrefixApplyRaw("@+", "+", "o");
+    print("prefix-add-existing=<", mp1.take(), ">\n");
+    Task<string> mp2 = spawn IrcPrefixApplyRaw("+", "+", "o");
+    print("prefix-add=<", mp2.take(), ">\n");
+    Task<string> mp3 = spawn IrcPrefixApplyRaw("@+", "-", "o");
+    print("prefix-remove=<", mp3.take(), ">\n");
+    Task<string> mrename = spawn IrcMemberRenameRaw(members, "bob", "dave");
+    print("memberrename=<", mrename.take(), ">\n");
+    Task<string> mremove = spawn IrcMemberRemoveRaw(members, "CAROL");
+    print("memberremove=<", mremove.take(), ">\n");
+
+    // Mode letters and the member changes that accompany +o/+v style modes.
+    Task<string> modes1 = spawn IrcModeApplyRaw("nt", "+i-n+o");
+    print("modes=<", modes1.take(), ">\n");
+    Task<string> changes = spawn IrcModeMemberChangesRaw("+ov-l+k", "alice bob carol");
+    print("modechanges=<", changes.take(), ">\n");
+
+    // Outgoing bodies split on UTF-8 boundaries and CTCP ACTION detection.
+    Task<string> split1 = spawn IrcSplitRaw("abcdef", 4);
+    print("split=<", split1.take(), ">\n");
+    Task<string> split2 = spawn IrcSplitRaw("aébc", 3);
+    print("splitutf8=<", split2.take(), ">\n");
+    byte one = 1;
+    Task<string> markerTask = spawn BytesAppendRaw("", one);
+    string marker = markerTask.take();
+    string action = cat(cat(marker, "ACTION waves"), marker);
+    Task<string> actionText = spawn IrcActionTextRaw(action);
+    print("actiontext=<", actionText.take(), ">\n");
+    Task<string> plain = spawn IrcActionTextRaw("hello");
+    print("plaintext=<", plain.take(), ">\n");
+    action.dispose();
+    marker.dispose();
+
+    // Timestamped transcript forms and field slicing.
+    Task<string> fs = spawn IrcFormatSystemRaw("12:00", "alice joined");
+    print("system=<", fs.take(), ">\n");
+    Task<string> fn = spawn IrcFormatNoticeRaw("12:00", "alice", "notice");
+    print("notice=<", fn.take(), ">\n");
+    Task<string> fa = spawn IrcFormatActionRaw("12:00", "alice", "waves");
+    print("action=<", fa.take(), ">\n");
+    Task<string> ff = spawn IrcFieldsFromRaw("MODE #c +o alice bob", 2);
+    print("fields=<", ff.take(), ">\n");
+    Task<string> sc = spawn IrcStripColonRaw(":bye");
+    print("stripcolon=<", sc.take(), ">\n");
+    Task<string> sn = spawn IrcStripColonRaw("bye");
+    print("nocolon=<", sn.take(), ">\n");
+    Task<int64> ba = spawn IrcByteAtRaw("part ", 4);
+    print("byteat=", ba.take(), "\n");
+
+    // Conversation limit parsing.
+    Task<int64> cl0 = spawn IrcConversationLimitRaw("");
+    print("convlimit0=", cl0.take(), "\n");
+    Task<int64> cl1 = spawn IrcConversationLimitRaw("512");
+    print("convlimit1=", cl1.take(), "\n");
+    Task<int64> cl2 = spawn IrcConversationLimitRaw("9999");
+    print("convlimit2=", cl2.take(), "\n");
+
+    // Prefix parsing and the known-user table.
+    Task<string> px = spawn IrcPrefixRaw("@time=now :alice!u@h PRIVMSG #c :hi");
+    print("prefix=<", px.take(), ">\n");
+    Task<string> pn = spawn IrcNickFromPrefixRaw("alice!u@h");
+    print("prefixnick=<", pn.take(), ">\n");
+    Task<string> ph = spawn IrcUserHostRaw("alice!u@h");
+    print("userhost=<", ph.take(), ">\n");
+    string users = "";
+    Task<string> u1 = spawn IrcUserRowUpdateRaw(users, "alice", 1, "u");
+    users = u1.take();
+    Task<string> u2 = spawn IrcUserRowUpdateRaw(users, "alice", 2, "h");
+    users = u2.take();
+    Task<string> u3 = spawn IrcUserRowUpdateRaw(users, "bob", 3, "acct");
+    users = u3.take();
+    Task<string> shownUsers = spawn StringReplaceRaw(users, "\t", "|");
+    print("users=<", shownUsers.take(), ">\n");
+    Task<string> uf = spawn IrcUserRowFieldRaw(users, "ALICE", 2);
+    print("userfield=<", uf.take(), ">\n");
+    Task<string> ur = spawn IrcUserRowRenameRaw(users, "bob", "carol");
+    string renamedUsers = ur.take();
+    Task<string> shownRenamed = spawn StringReplaceRaw(renamedUsers, "\t", "|");
+    print("userrename=<", shownRenamed.take(), ">\n");
+    renamedUsers.dispose();
+    Task<int64> rv0 = spawn IrcRateValueRaw("", 2, 20);
+    print("rate0=", rv0.take(), "\n");
+    Task<int64> rv1 = spawn IrcRateValueRaw("7", 2, 20);
+    print("rate1=", rv1.take(), "\n");
+    Task<int64> rv2 = spawn IrcRateValueRaw("99", 2, 20);
+    print("rate2=", rv2.take(), "\n");
+    Task<string> it = spawn IrcIntTextRaw(42);
+    print("inttext=<", it.take(), ">\n");
 
     // History limit parsing, drop policy, and a zlib roundtrip.
     Task<int64> hl0 = spawn IrcHistoryLimitRaw("0");

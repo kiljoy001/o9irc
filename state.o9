@@ -1,0 +1,1061 @@
+// Per-conversation state helpers shared by the service and the host tests.
+//
+// Channel members are stored as one entry per line:
+//
+//     prefixes<TAB>nick\n
+//
+// `prefixes` is the raw IRC membership prefix set (`@`, `+`, `@+`, ...).
+// `IrcMembersRenderRaw` turns that into the display form written to the
+// `nicks` 9P file. Keeping the prefix set separate from the nick makes mode
+// changes and nick renames cheap and keeps the on-disk view compatible.
+
+// Case-fold two IRC nicknames for comparison. RFC 1459 casemapping folds
+// A-Z and the four Scandinavian characters onto their ASCII equivalents.
+function IrcNickEqualRaw(string left, string right) bool {
+    bool out;
+    c {
+        uchar *a, *b;
+        vlong i, n;
+        int x, y;
+
+        a = (uchar*)o9_string_data(left);
+        b = (uchar*)o9_string_data(right);
+        n = o9_string_len(left);
+        out = n == o9_string_len(right) && (a != nil) == (b != nil);
+        for(i = 0; out && i < n; i++){
+            x = a[i];
+            y = b[i];
+            if(x >= 'A' && x <= 'Z') x += 'a' - 'A';
+            if(y >= 'A' && y <= 'Z') y += 'a' - 'A';
+            if(x == '{') x = '[';
+            else if(x == '}') x = ']';
+            else if(x == '|') x = '\\';
+            else if(x == '^') x = '~';
+            if(y == '{') y = '[';
+            else if(y == '}') y = ']';
+            else if(y == '|') y = '\\';
+            else if(y == '^') y = '~';
+            if(x != y)
+                out = 0;
+        }
+    }
+    return out;
+}
+
+// Return the byte offset of the member line for `nick`, or -1.
+function IrcMemberFindRaw(string members, string nick) int64 {
+    int64 out;
+    c {
+        uchar *p, *end, *line, *stop, *tab, *name;
+        vlong nn, i, len;
+        int x, y, same;
+
+        out = -1;
+        p = (uchar*)o9_string_data(members);
+        len = o9_string_len(members);
+        end = p + len;
+        nn = o9_string_len(nick);
+        line = p;
+        while(line < end && out < 0){
+            stop = memchr(line, '\n', end - line);
+            if(stop == nil)
+                stop = end;
+            tab = memchr(line, '\t', stop - line);
+            name = tab != nil ? tab + 1 : line;
+            if(stop - name == nn){
+                same = 1;
+                for(i = 0; i < nn && same; i++){
+                    x = name[i];
+                    y = ((uchar*)o9_string_data(nick))[i];
+                    if(x >= 'A' && x <= 'Z') x += 'a' - 'A';
+                    if(y >= 'A' && y <= 'Z') y += 'a' - 'A';
+                    if(x == '{') x = '[';
+                    else if(x == '}') x = ']';
+                    else if(x == '|') x = '\\';
+                    else if(x == '^') x = '~';
+                    if(y == '{') y = '[';
+                    else if(y == '}') y = ']';
+                    else if(y == '|') y = '\\';
+                    else if(y == '^') y = '~';
+                    if(x != y)
+                        same = 0;
+                }
+                if(same)
+                    out = line - p;
+            }
+            line = stop < end ? stop + 1 : end;
+        }
+    }
+    return out;
+}
+
+function IrcMemberContainsRaw(string members, string nick) bool {
+    Task<int64> found = spawn IrcMemberFindRaw(members, nick);
+    return found.take() >= 0;
+}
+
+function IrcMemberPrefixRaw(string members, string nick) string {
+    string out;
+    Task<int64> found = spawn IrcMemberFindRaw(members, nick);
+    int64 at = found.take();
+    c {
+        uchar *p, *line, *stop, *tab;
+        vlong len;
+        int done;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(members);
+        len = o9_string_len(members);
+        done = 0;
+        if(at >= 0 && at < len){
+            line = p + at;
+            stop = memchr(line, '\n', len - at);
+            if(stop == nil)
+                stop = p + len;
+            tab = memchr(line, '\t', stop - line);
+            if(tab != nil){
+                o9_string_release(out);
+                out = o9_string_new((char*)line, tab - line);
+                done = 1;
+            }
+        }
+        if(!done)
+            out = o9_string_from_c("");
+    }
+    return out;
+}
+
+function IrcMemberCountRaw(string members) int64 {
+    int64 out;
+    c {
+        uchar *p, *end;
+        vlong len;
+
+        out = 0;
+        p = (uchar*)o9_string_data(members);
+        len = o9_string_len(members);
+        end = p + len;
+        while(p < end){
+            if(*p == '\n')
+                out++;
+            p++;
+        }
+        if(len > 0 && p[-1] != '\n')
+            out++;
+    }
+    return out;
+}
+
+// Insert or replace one member. The entry keeps server order.
+function IrcMemberUpsertRaw(string members, string nick, string prefixes) string {
+    string out;
+    Task<int64> found = spawn IrcMemberFindRaw(members, nick);
+    int64 at = found.take();
+    c {
+        uchar *p, *end, *line, *stop, *buf, *q;
+        vlong len, nn, pn, w, need;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(members);
+        len = o9_string_len(members);
+        end = p + len;
+        nn = o9_string_len(nick);
+        pn = o9_string_len(prefixes);
+        need = len + pn + nn + 3;
+        buf = malloc(need + 1);
+        if(buf != nil){
+            q = buf;
+            if(at >= 0){
+                w = at;
+                memmove(q, p, w);
+                q += w;
+                memmove(q, o9_string_data(prefixes), pn);
+                q += pn;
+                *q++ = '\t';
+                memmove(q, o9_string_data(nick), nn);
+                q += nn;
+                *q++ = '\n';
+                line = p + at;
+                stop = memchr(line, '\n', end - line);
+                if(stop != nil){
+                    w = end - (stop + 1);
+                    memmove(q, stop + 1, w);
+                    q += w;
+                }
+            } else {
+                memmove(q, p, len);
+                q += len;
+                if(len > 0 && q[-1] != '\n')
+                    *q++ = '\n';
+                memmove(q, o9_string_data(prefixes), pn);
+                q += pn;
+                *q++ = '\t';
+                memmove(q, o9_string_data(nick), nn);
+                q += nn;
+                *q++ = '\n';
+            }
+            o9_string_release(out);
+            out = o9_string_new((char*)buf, q - buf);
+            free(buf);
+        }
+    }
+    return out;
+}
+
+function IrcMemberRemoveRaw(string members, string nick) string {
+    string out;
+    Task<int64> found = spawn IrcMemberFindRaw(members, nick);
+    int64 at = found.take();
+    c {
+        uchar *p, *end, *line, *stop, *buf, *q;
+        vlong len, w;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(members);
+        len = o9_string_len(members);
+        end = p + len;
+        if(at >= 0){
+            buf = malloc(len + 1);
+            if(buf != nil){
+                q = buf;
+                memmove(q, p, at);
+                q += at;
+                line = p + at;
+                stop = memchr(line, '\n', end - line);
+                if(stop != nil){
+                    w = end - (stop + 1);
+                    memmove(q, stop + 1, w);
+                    q += w;
+                }
+                o9_string_release(out);
+                out = o9_string_new((char*)buf, q - buf);
+                free(buf);
+            }
+        } else {
+            o9_string_release(out);
+            out = o9_string_new(o9_string_data(members), len);
+        }
+    }
+    return out;
+}
+
+function IrcMemberRenameRaw(string members, string oldNick, string newNick) string {
+    string out;
+    Task<int64> found = spawn IrcMemberFindRaw(members, oldNick);
+    int64 at = found.take();
+    c {
+        uchar *p, *end, *line, *stop, *tab, *buf, *q;
+        vlong len, nn, pn, w;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(members);
+        len = o9_string_len(members);
+        end = p + len;
+        if(at < 0){
+            out = o9_string_new(o9_string_data(members), len);
+        } else {
+        line = p + at;
+        stop = memchr(line, '\n', end - line);
+        if(stop == nil)
+            stop = end;
+        tab = memchr(line, '\t', stop - line);
+        pn = tab != nil ? tab - line : 0;
+        nn = o9_string_len(newNick);
+        buf = malloc(len + nn + 2);
+        if(buf != nil){
+            q = buf;
+            memmove(q, p, at);
+            q += at;
+            memmove(q, line, pn);
+            q += pn;
+            *q++ = '\t';
+            memmove(q, o9_string_data(newNick), nn);
+            q += nn;
+            *q++ = '\n';
+            if(stop < end){
+                w = end - (stop + 1);
+                memmove(q, stop + 1, w);
+                q += w;
+            }
+            o9_string_release(out);
+            out = o9_string_new((char*)buf, q - buf);
+            free(buf);
+        }
+        }
+    }
+    return out;
+}
+
+// Render the `nicks` view: prefixes directly attached to the nick.
+function IrcMembersRenderRaw(string members) string {
+    string out;
+    c {
+        uchar *p, *end, *line, *stop, *tab, *buf, *q;
+        vlong len;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(members);
+        len = o9_string_len(members);
+        end = p + len;
+        buf = malloc(len + 2);
+        if(buf != nil){
+            q = buf;
+            line = p;
+            while(line < end){
+                stop = memchr(line, '\n', end - line);
+                if(stop == nil)
+                    stop = end;
+                tab = memchr(line, '\t', stop - line);
+                if(tab != nil){
+                    memmove(q, line, tab - line);
+                    q += tab - line;
+                    memmove(q, tab + 1, stop - (tab + 1));
+                    q += stop - (tab + 1);
+                } else {
+                    memmove(q, line, stop - line);
+                    q += stop - line;
+                }
+                *q++ = '\n';
+                line = stop < end ? stop + 1 : end;
+            }
+            o9_string_release(out);
+            out = o9_string_new((char*)buf, q - buf);
+            free(buf);
+        }
+    }
+    return out;
+}
+
+// Add one NAMES token (`@+nick`, `@nick`, or `nick!user@host`) to a member
+// list. User/host suffixes are dropped; the prefix set replaces an existing
+// entry so repeated NAMES replies converge on one entry per nick.
+function IrcNamesAddRaw(string members, string token) string {
+    string out = "";
+    string prefixes = "";
+    string nick = "";
+    c {
+        uchar *p, *at;
+        vlong len, start, stop;
+
+        p = (uchar*)o9_string_data(token);
+        len = o9_string_len(token);
+        start = 0;
+        while(start < len && (p[start] == '~' || p[start] == '&' ||
+              p[start] == '@' || p[start] == '%' || p[start] == '+'))
+            start++;
+        stop = len;
+        if((at = memchr(p + start, '!', len - start)) != nil)
+            stop = at - p;
+        if(stop > start){
+            o9_string_release(prefixes);
+            o9_string_release(nick);
+            prefixes = o9_string_new((char*)p, start);
+            nick = o9_string_new((char*)p + start, stop - start);
+        }
+    }
+    if(len(nick) > 0) {
+        Task<string> merged = spawn IrcMemberUpsertRaw(members, nick, prefixes);
+        out.dispose();
+        out = merged.take();
+    }
+    prefixes.dispose();
+    nick.dispose();
+    return out;
+}
+
+// Apply one channel mode letter to a prefix set. Returns the updated set.
+function IrcPrefixApplyRaw(string prefixes, string sign, string mode) string {
+    string out;
+    c {
+        uchar *p, *q;
+        vlong len, i;
+        char add, wanted[2];
+        int removing, present;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(prefixes);
+        len = o9_string_len(prefixes);
+        add = 0;
+        if(o9_string_len(mode) == 1){
+            switch(((uchar*)o9_string_data(mode))[0]){
+            case 'q': add = '~'; break;
+            case 'a': add = '&'; break;
+            case 'o': add = '@'; break;
+            case 'h': add = '%'; break;
+            case 'v': add = '+'; break;
+            default: break;
+            }
+        }
+        removing = o9_string_len(sign) == 1 && ((uchar*)o9_string_data(sign))[0] == '-';
+        present = 0;
+        for(i = 0; i < len; i++)
+            if(p[i] == add)
+                present = 1;
+        if(add != 0 && !(present && !removing) && !(!present && removing)){
+            if(!removing){
+                q = malloc(len + 2);
+                if(q != nil){
+                    memmove(q, p, len);
+                    q[len] = add;
+                    o9_string_release(out);
+                    out = o9_string_new((char*)q, len + 1);
+                    free(q);
+                }
+            } else {
+                q = malloc(len + 1);
+                if(q != nil){
+                    vlong w = 0;
+                    for(i = 0; i < len; i++)
+                        if(p[i] != add)
+                            q[w++] = p[i];
+                    o9_string_release(out);
+                    out = o9_string_new((char*)q, w);
+                    free(q);
+                }
+            }
+        }
+        USED(wanted);
+    }
+    return out;
+}
+
+// Apply a mode specification such as `+nt-o` to a channel mode letter set.
+// Mode parameters are ignored here; callers handle +o/+v nick separately.
+function IrcModeApplyRaw(string modes, string spec) string {
+    string out;
+    c {
+        uchar *p, *end, *q, *buf;
+        vlong len, w;
+        char sign;
+        int ch, i, present;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(modes);
+        len = o9_string_len(modes);
+        end = (uchar*)o9_string_data(spec) + o9_string_len(spec);
+        q = (uchar*)o9_string_data(spec);
+        buf = malloc(len + o9_string_len(spec) + 2);
+        if(buf != nil){
+            w = 0;
+            for(i = 0; i < len; i++)
+                if(p[i] != '+' && p[i] != '-')
+                    buf[w++] = p[i];
+            sign = '+';
+            while(q < end){
+                ch = *q++;
+                if(ch == '+' || ch == '-'){
+                    sign = ch;
+                    continue;
+                }
+                if(ch <= ' ')
+                    continue;
+                present = 0;
+                for(i = 0; i < w; i++)
+                    if(buf[i] == ch)
+                        present = 1;
+                if(sign == '+' && !present)
+                    buf[w++] = ch;
+                else if(sign == '-' && present){
+                    for(i = 0; i < w; i++)
+                        if(buf[i] == ch){
+                            memmove(buf + i, buf + i + 1, w - i - 1);
+                            w--;
+                            break;
+                        }
+                }
+            }
+            o9_string_release(out);
+            out = o9_string_new((char*)buf, w);
+            free(buf);
+        }
+        USED(end);
+    }
+    return out;
+}
+
+// Strip one leading colon from a user-supplied trailing argument, so both
+// `kick #c nick :bye` and `kick #c nick bye` frame identically.
+function IrcStripColonRaw(string value) string {
+    string out;
+    c {
+        uchar *p;
+        vlong n;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(value);
+        n = o9_string_len(value);
+        if(n > 0 && p[0] == ':'){
+            o9_string_release(out);
+            out = o9_string_new((char*)p + 1, n - 1);
+        } else {
+            o9_string_release(out);
+            out = o9_string_new(o9_string_data(value), n);
+        }
+    }
+    return out;
+}
+
+// Byte value at one index, or -1 past the end. Used to inspect a separator
+// without slicing the string into a Task.
+function IrcByteAtRaw(string text, int64 index) int64 {
+    int64 out;
+    c {
+        vlong n;
+
+        out = -1;
+        n = o9_string_len(text);
+        if(index >= 0 && index < n)
+            out = ((uchar*)o9_string_data(text))[index];
+    }
+    return out;
+}
+
+// Return the part of a space-separated line after `skip` leading fields.
+// Used to pass the parameter list of a MODE change onward unchanged.
+function IrcFieldsFromRaw(string text, int64 skip) string {
+    string out;
+    c {
+        uchar *p, *end;
+        vlong n, i;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(text);
+        end = p + o9_string_len(text);
+        for(i = 0; i < skip && p < end; i++){
+            while(p < end && *p == ' ')
+                p++;
+            while(p < end && *p != ' ')
+                p++;
+        }
+        while(p < end && *p == ' ')
+            p++;
+        n = end - p;
+        if(n > 0){
+            o9_string_release(out);
+            out = o9_string_new((char*)p, n);
+        }
+    }
+    return out;
+}
+
+// Expand a MODE change into member prefix updates. `params` is the
+// space-separated argument list that follows the mode specification. Each
+// output line is `sign<TAB>mode<TAB>nick\n` for +o/+v/+h/+a/+q changes.
+function IrcModeMemberChangesRaw(string spec, string params) string {
+    string out;
+    c {
+        uchar *p, *end, *q, *qend, *start, *stop, *buf, *w;
+        vlong size;
+        char sign;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(spec);
+        end = p + o9_string_len(spec);
+        q = (uchar*)o9_string_data(params);
+        qend = q + o9_string_len(params);
+        size = o9_string_len(spec) + o9_string_len(params) + 8;
+        buf = malloc(size + 1);
+        if(buf != nil){
+            w = buf;
+            sign = '+';
+            while(p < end){
+                int ch = *p++;
+                int takes = 0;
+                int member = 0;
+                if(ch == '+' || ch == '-'){
+                    sign = ch;
+                    continue;
+                }
+                if(ch == 'o' || ch == 'v' || ch == 'h' ||
+                   ch == 'a' || ch == 'q'){
+                    takes = 1;
+                    member = 1;
+                } else if(ch == 'b' || ch == 'e' || ch == 'I' || ch == 'k'){
+                    takes = 1;
+                } else if(ch == 'l'){
+                    takes = sign == '+';
+                }
+                if(!takes)
+                    continue;
+                while(q < qend && *q == ' ')
+                    q++;
+                start = q;
+                while(q < qend && *q != ' ')
+                    q++;
+                stop = q;
+                if(stop <= start)
+                    continue;
+                if(member){
+                    *w++ = sign;
+                    *w++ = '\t';
+                    *w++ = ch;
+                    *w++ = '\t';
+                    memmove(w, start, stop - start);
+                    w += stop - start;
+                    *w++ = '\n';
+                }
+            }
+            o9_string_release(out);
+            out = o9_string_new((char*)buf, w - buf);
+            free(buf);
+        }
+        USED(end);
+    }
+    return out;
+}
+
+// Split an outgoing message body on UTF-8 boundaries. Chunks are returned
+// separated by newlines. A continuation byte never starts a chunk.
+function IrcSplitRaw(string body, int64 maximum) string {
+    string out;
+    c {
+        uchar *p, *buf, *q;
+        vlong len, at, take, cut, size;
+
+        out = o9_string_from_c("");
+        len = o9_string_len(body);
+        if(len > 0 && maximum > 0){
+            size = len + (len / maximum + 2);
+            buf = malloc(size + 1);
+            if(buf != nil){
+                p = (uchar*)o9_string_data(body);
+                q = buf;
+                at = 0;
+                while(at < len){
+                    take = len - at;
+                    if(take > maximum)
+                        take = maximum;
+                    if(at + take < len){
+                        cut = take;
+                        while(cut > 0 && (p[at + cut] & 0xC0) == 0x80)
+                            cut--;
+                        if(cut > 0)
+                            take = cut;
+                    }
+                    memmove(q, p + at, take);
+                    q += take;
+                    *q++ = '\n';
+                    at += take;
+                }
+                o9_string_release(out);
+                out = o9_string_new((char*)buf, q - buf);
+                free(buf);
+            }
+        }
+    }
+    return out;
+}
+
+// Return the text of a CTCP ACTION body (`\001ACTION waves\001`), or an
+// empty string when the body is not an ACTION. Other CTCP requests stay out
+// of the transcript and remain visible in the raw event stream.
+function IrcActionTextRaw(string body) string {
+    string out;
+    c {
+        uchar *p;
+        vlong len;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(body);
+        len = o9_string_len(body);
+        if(len > 9 && p[0] == 1 && p[len-1] == 1 &&
+           p[1] == 'A' && p[2] == 'C' && p[3] == 'T' && p[4] == 'I' &&
+           p[5] == 'O' && p[6] == 'N' && p[7] == ' '){
+            o9_string_release(out);
+            out = o9_string_new((char*)p + 8, len - 9);
+        }
+    }
+    return out;
+}
+
+// `[stamp] * text\n`, used for joins, parts, quits, kicks, and mode changes.
+function IrcFormatSystemRaw(string stamp, string text) string {
+    string out;
+    c {
+        char *buf;
+        vlong n;
+
+        n = o9_string_len(stamp) + o9_string_len(text) + 8;
+        out = o9_string_from_c("");
+        if(n > 0 && n <= 16384 && (buf = malloc(n + 1)) != nil){
+            n = snprint(buf, n + 1, "[%.*s] * %.*s\n",
+                (int)o9_string_len(stamp), o9_string_data(stamp),
+                (int)o9_string_len(text), o9_string_data(text));
+            o9_string_release(out);
+            out = o9_string_new(buf, n);
+            free(buf);
+        }
+    }
+    return out;
+}
+
+// `[stamp] -sender- text\n`, used for NOTICE.
+function IrcFormatNoticeRaw(string stamp, string sender, string text) string {
+    string out;
+    c {
+        char *buf;
+        vlong n;
+
+        n = o9_string_len(stamp) + o9_string_len(sender) +
+            o9_string_len(text) + 10;
+        out = o9_string_from_c("");
+        if(n > 0 && n <= 16384 && (buf = malloc(n + 1)) != nil){
+            n = snprint(buf, n + 1, "[%.*s] -%.*s- %.*s\n",
+                (int)o9_string_len(stamp), o9_string_data(stamp),
+                (int)o9_string_len(sender), o9_string_data(sender),
+                (int)o9_string_len(text), o9_string_data(text));
+            o9_string_release(out);
+            out = o9_string_new(buf, n);
+            free(buf);
+        }
+    }
+    return out;
+}
+
+// `[stamp] * nick action\n`, used for CTCP ACTION.
+function IrcFormatActionRaw(string stamp, string sender, string text) string {
+    string out;
+    c {
+        char *buf;
+        vlong n;
+
+        n = o9_string_len(stamp) + o9_string_len(sender) +
+            o9_string_len(text) + 10;
+        out = o9_string_from_c("");
+        if(n > 0 && n <= 16384 && (buf = malloc(n + 1)) != nil){
+            n = snprint(buf, n + 1, "[%.*s] * %.*s %.*s\n",
+                (int)o9_string_len(stamp), o9_string_data(stamp),
+                (int)o9_string_len(sender), o9_string_data(sender),
+                (int)o9_string_len(text), o9_string_data(text));
+            o9_string_release(out);
+            out = o9_string_new(buf, n);
+            free(buf);
+        }
+    }
+    return out;
+}
+
+// Conversation limit from `o9ircmaxconversations`; 256 default, 1024 cap.
+function IrcConversationLimitRaw(string value) int64 {
+    int64 out;
+    c {
+        char *s, *end;
+        vlong n;
+
+        out = 256;
+        s = o9_string_cstr(value);
+        if(s != nil && s[0] != 0){
+            n = strtoll(s, &end, 10);
+            if(*end == 0 && n > 0 && n <= 1024)
+                out = n;
+        }
+        free(s);
+    }
+    return out;
+}
+
+// Full IRC prefix (`nick!user@host`) with IRCv3 tags and the leading colon
+// removed. Server-originated lines return the server name.
+function IrcPrefixRaw(string line) string {
+    string out;
+    c {
+        uchar *p, *end, *start, *space;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(line);
+        end = p + o9_string_len(line);
+        if(p < end && *p == '@'){
+            space = memchr(p, ' ', end - p);
+            p = space != nil ? space + 1 : end;
+        }
+        if(p < end && *p == ':')
+            p++;
+        start = p;
+        while(p < end && *p != ' ')
+            p++;
+        if(p > start){
+            o9_string_release(out);
+            out = o9_string_new((char*)start, p - start);
+        }
+    }
+    return out;
+}
+
+// Nickname part of a full prefix.
+function IrcNickFromPrefixRaw(string prefix) string {
+    string out;
+    c {
+        uchar *p, *start, *end;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(prefix);
+        end = p + o9_string_len(prefix);
+        start = p;
+        while(p < end && *p != '!' && *p != '@' && *p != ' ')
+            p++;
+        if(p > start){
+            o9_string_release(out);
+            out = o9_string_new((char*)start, p - start);
+        }
+    }
+    return out;
+}
+
+// `user<TAB>host` from a full prefix, or an empty string for a server name.
+function IrcUserHostRaw(string prefix) string {
+    string out;
+    c {
+        uchar *p, *end, *bang, *at, *buf;
+        vlong n;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(prefix);
+        end = p + o9_string_len(prefix);
+        bang = memchr(p, '!', end - p);
+        at = bang != nil ? memchr(bang + 1, '@', end - (bang + 1)) : nil;
+        if(bang != nil && at != nil){
+            n = (at - bang - 1) + (end - at - 1) + 1;
+            buf = malloc(n);
+            if(buf != nil){
+                memmove(buf, bang + 1, at - bang - 1);
+                buf[at - bang - 1] = '\t';
+                memmove(buf + (at - bang - 1) + 1, at + 1, end - at - 1);
+                o9_string_release(out);
+                out = o9_string_new((char*)buf, n);
+                free(buf);
+            }
+        }
+    }
+    return out;
+}
+
+// Update one field of a `nick<TAB>user<TAB>host<TAB>account<TAB>away` row.
+// Missing rows are created with six fields. Nick matching is case-folded.
+function IrcUserRowUpdateRaw(string rows, string nick, int64 field,
+                             string value) string {
+    string out;
+    c {
+        uchar *p, *end, *line, *stop, *seg, *fend, *buf, *q, *v;
+        vlong len, nn, vn, f, nf, i;
+        int found, match, x, y;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(rows);
+        len = o9_string_len(rows);
+        end = p + len;
+        nn = o9_string_len(nick);
+        v = (uchar*)o9_string_data(value);
+        vn = o9_string_len(value);
+        buf = malloc(len + nn + vn + 96);
+        if(buf != nil){
+            q = buf;
+            found = 0;
+            line = p;
+            while(line < end){
+                stop = memchr(line, '\n', end - line);
+                if(stop == nil)
+                    stop = end;
+                fend = memchr(line, '\t', stop - line);
+                if(fend == nil)
+                    fend = stop;
+                match = fend - line == nn;
+                for(i = 0; match && i < nn; i++){
+                    x = line[i];
+                    y = ((uchar*)o9_string_data(nick))[i];
+                    if(x >= 'A' && x <= 'Z') x += 'a' - 'A';
+                    if(y >= 'A' && y <= 'Z') y += 'a' - 'A';
+                    if(x == '{') x = '[';
+                    else if(x == '}') x = ']';
+                    else if(x == '|') x = '\\';
+                    else if(x == '^') x = '~';
+                    if(y == '{') y = '[';
+                    else if(y == '}') y = ']';
+                    else if(y == '|') y = '\\';
+                    else if(y == '^') y = '~';
+                    if(x != y)
+                        match = 0;
+                }
+                if(match){
+                    found = 1;
+                    nf = 1;
+                    for(seg = line; seg < stop; seg++)
+                        if(*seg == '\t')
+                            nf++;
+                    seg = line;
+                    for(f = 0; f < 6; f++){
+                        if(f < nf){
+                            fend = memchr(seg, '\t', stop - seg);
+                            if(fend == nil)
+                                fend = stop;
+                        } else
+                            fend = seg;
+                        if(f == field){
+                            memmove(q, v, vn);
+                            q += vn;
+                        } else {
+                            memmove(q, seg, fend - seg);
+                            q += fend - seg;
+                        }
+                        if(f < 5)
+                            *q++ = '\t';
+                        if(f < nf)
+                            seg = fend < stop ? fend + 1 : stop;
+                    }
+                    *q++ = '\n';
+                } else {
+                    memmove(q, line, stop - line);
+                    q += stop - line;
+                    *q++ = '\n';
+                }
+                line = stop < end ? stop + 1 : end;
+            }
+            if(!found){
+                if(field == 0){
+                    memmove(q, v, vn);
+                    q += vn;
+                } else {
+                    memmove(q, o9_string_data(nick), nn);
+                    q += nn;
+                }
+                for(f = 1; f < 6; f++){
+                    *q++ = '\t';
+                    if(f == field){
+                        memmove(q, v, vn);
+                        q += vn;
+                    }
+                }
+                *q++ = '\n';
+            }
+            o9_string_release(out);
+            out = o9_string_new((char*)buf, q - buf);
+            free(buf);
+        }
+    }
+    return out;
+}
+
+// Read one field from a known-user row. Returns an empty string when the
+// user or field is absent.
+function IrcUserRowFieldRaw(string rows, string nick, int64 field) string {
+    string out;
+    c {
+        uchar *p, *end, *line, *stop, *seg, *fend;
+        vlong nn, f, nf, i;
+        int match, x, y, done;
+
+        out = o9_string_from_c("");
+        p = (uchar*)o9_string_data(rows);
+        end = p + o9_string_len(rows);
+        nn = o9_string_len(nick);
+        done = 0;
+        line = p;
+        while(line < end && !done){
+            stop = memchr(line, '\n', end - line);
+            if(stop == nil)
+                stop = end;
+            fend = memchr(line, '\t', stop - line);
+            if(fend == nil)
+                fend = stop;
+            match = fend - line == nn;
+            for(i = 0; match && i < nn; i++){
+                x = line[i];
+                y = ((uchar*)o9_string_data(nick))[i];
+                if(x >= 'A' && x <= 'Z') x += 'a' - 'A';
+                if(y >= 'A' && y <= 'Z') y += 'a' - 'A';
+                if(x == '{') x = '[';
+                else if(x == '}') x = ']';
+                else if(x == '|') x = '\\';
+                else if(x == '^') x = '~';
+                if(y == '{') y = '[';
+                else if(y == '}') y = ']';
+                else if(y == '|') y = '\\';
+                else if(y == '^') y = '~';
+                if(x != y)
+                    match = 0;
+            }
+            if(match){
+                nf = 1;
+                for(seg = line; seg < stop; seg++)
+                    if(*seg == '\t')
+                        nf++;
+                if(field < nf){
+                    seg = line;
+                    for(f = 0; f < field; f++){
+                        fend = memchr(seg, '\t', stop - seg);
+                        if(fend == nil)
+                            break;
+                        seg = fend + 1;
+                    }
+                    fend = memchr(seg, '\t', stop - seg);
+                    if(fend == nil)
+                        fend = stop;
+                    o9_string_release(out);
+                    out = o9_string_new((char*)seg, fend - seg);
+                    done = 1;
+                }
+            }
+            line = stop < end ? stop + 1 : end;
+        }
+    }
+    return out;
+}
+
+// Rename a known-user row. If the new nick already has a row, both remain;
+// callers use this only for live NICK changes.
+function IrcUserRowRenameRaw(string rows, string oldNick, string newNick) string {
+    string out;
+    Task<string> updated = spawn IrcUserRowUpdateRaw(rows, oldNick, 0, newNick);
+    out = updated.take();
+    return out;
+}
+
+// Parse a positive rate value, clamped to `maximum`, or return `fallback`.
+function IrcRateValueRaw(string value, int64 fallback, int64 maximum) int64 {
+    int64 out;
+    c {
+        char *s, *end;
+        vlong n;
+
+        out = fallback;
+        s = o9_string_cstr(value);
+        if(s != nil && s[0] != 0){
+            n = strtoll(s, &end, 10);
+            if(*end == 0 && n > 0 && n <= maximum)
+                out = n;
+        }
+        free(s);
+    }
+    return out;
+}
+
+// Decimal text for an int64, used for status files.
+function IrcIntTextRaw(int64 value) string {
+    string out;
+    c {
+        char buf[32];
+        int n;
+
+        n = snprint(buf, sizeof buf, "%lld", (vlong)value);
+        out = o9_string_new(buf, n);
+    }
+    return out;
+}
+
+// Monotonic milliseconds and a blocking sleep for the outbound pacer.
+function IrcNowMsRaw() int64 {
+    int64 out;
+    c {
+        out = nsec() / 1000000;
+    }
+    return out;
+}
+
+function IrcSleepRaw(int64 ms) int64 {
+    int64 out;
+    c {
+        if(ms > 0)
+            sleep((int)ms);
+        out = ms;
+    }
+    return out;
+}

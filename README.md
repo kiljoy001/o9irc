@@ -26,8 +26,15 @@ If the server rejects the chosen nickname during registration, it tries a
 short fallback such as `nickname_`, then numbered variants through `_9`.
 
 Type a message to send to the current channel, or use `/join #channel`,
-`/msg target text`, `/nick newname`, `/help`, and `/quit`. Server messages are
-shown as raw IRC lines so protocol errors remain visible.
+`/part [#channel] [reason]`, `/msg target text`, `/notice target text`,
+`/me action`, `/topic [#channel] [text]`, `/mode target modes`,
+`/kick #channel nick [reason]`, `/whois nick`, `/away [message]`,
+`/invite nick [#channel]`, `/nick newname`, `/help`, and `/quit`. Server
+messages are shown as raw IRC lines so protocol errors remain visible.
+`nicks` reflects live JOIN, PART, QUIT, KICK, NICK, and MODE changes, and
+`modes` shows the channel mode letters currently in force. Message bodies are
+split into multiple IRC frames at UTF-8 boundaries instead of being rejected
+when they exceed one line.
 
 The 9P service exposes an actor owned network view. To set up a connection in
 Rio, start the launcher without arguments:
@@ -80,15 +87,21 @@ trusted-keys file after the optional history directory and byte limit:
 ./ircfs ircfs tls!irc.example.net!6697 nickname '#channel' $home/lib/o9irc 262144 $home/lib/o9irc/irc.example.net.keys
 ```
 
-The view also accepts `join #channel`, `msg target text`, `nick newname`, and
-`quit` in `input`. `profile<TAB>host<TAB>port<TAB>nick<TAB>channel<TAB>full name<TAB>tls<TAB>/absolute/path/to/trustedkeys`
+The view also accepts `join #channel`, `part [#channel] [reason]`,
+`msg target text`, `notice target text`, `me action`,
+`topic [#channel] [text]`, `mode target modes`,
+`kick #channel nick [reason]`, `whois nick`, `away [message]`,
+`invite nick [#channel]`, `nick newname`, and `quit` in `input`.
+`profile<TAB>host<TAB>port<TAB>nick<TAB>channel<TAB>full name<TAB>tls<TAB>/absolute/path/to/trustedkeys`
 saves a TLS profile; use `tcp` and an empty final field for plain TCP.
 `connect<TAB>...` saves it and starts the connection. Existing five-field
 profiles remain valid and use plain TCP. The Rio
 GUI reads the conversation index and selected
-conversation's topic, transcript, and nick names from this mount, and writes
-commands to `input`; it does not own a socket. Type plain messages in its
-input line, or use `/join`, `/msg`, `/nick`, and `/quit`. Press Esc to close the
+conversation's topic, transcript, nick names, and modes from this mount, and
+writes commands to `input`; it does not own a socket. Type plain messages in
+its input line, or use the same slash commands as the terminal client
+(`/join`, `/part`, `/msg`, `/notice`, `/me`, `/topic`, `/mode`, `/kick`,
+`/whois`, `/away`, `/invite`, `/nick`, and `/quit`). Press Esc to close the
 GUI. `events` remains a bounded snapshot of raw IRC lines. The GUI has a
 classic mIRC-like tree, switchbar, conversation, and nick list. Click Status,
 a channel, or a person in the tree to switch views. A plain message goes to
@@ -121,10 +134,16 @@ o9irc-start 'tcp!irc.example.net!6667' nickname '#channel'
 These settings take effect when a new service starts; an already running
 service keeps its current settings. History files are private to the 9front
 user and the GUI never reads the compressed format directly.
-It currently shows one network and up to 64 channel or private conversations. See
+It currently shows one network. The number of channels and private
+conversations defaults to 256 and can be set with
+`o9ircmaxconversations` (1 through 1024) before starting the service.
+The outbound pacer sends two lines per second with a burst of five by default;
+`o9ircratelimit` (1 through 20) and `o9ircrateburst` (1 through 50) override
+that. `queue` shows how many frames are waiting. The top-level `knownusers`
+file lists every nick seen with its user, host, account, and away state. See
 [DESIGN.md](DESIGN.md) for the view layout and next steps.
 
-Next steps: stable event cursors, native TLS, and richer IRC state.
+Next steps: reconnect supervision, stable event cursors, and native TLS.
 
 To run the protocol test from Linux, use a local 9front disk image with o9c
 installed:

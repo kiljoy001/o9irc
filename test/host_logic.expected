@@ -13,6 +13,62 @@ uiwrite=3
 nick1=<testnick_>
 nick9=<abcdefg_9>
 payload=<PRIVMSG #c :hello>
+members=<@+alice
+bob
+carol
+>
+memberfind=0
+membercount=3
+memberprefix=<@+>
+prefix-add-existing=<>
+prefix-add=<+@>
+prefix-remove=<+>
+memberrename=<@+	alice
+	dave
+	carol
+>
+memberremove=<@+	alice
+	bob
+>
+modes=<tio>
+modechanges=<+	o	alice
++	v	bob
+>
+split=<abcd
+ef
+>
+splitutf8=<aé
+bc
+>
+actiontext=<waves>
+plaintext=<>
+system=<[12:00] * alice joined
+>
+notice=<[12:00] -alice- notice
+>
+action=<[12:00] * alice waves
+>
+fields=<+o alice bob>
+stripcolon=<bye>
+nocolon=<bye>
+byteat=32
+convlimit0=256
+convlimit1=512
+convlimit2=256
+prefix=<alice!u@h>
+prefixnick=<alice>
+userhost=<u	h>
+users=<alice|u|h|||
+bob|||acct||
+>
+userfield=<h>
+userrename=<alice|u|h|||
+carol|||acct||
+>
+rate0=2
+rate1=7
+rate2=2
+inttext=<42>
 histlimit0=0
 histlimit1=4096
 histlimitbad=262144

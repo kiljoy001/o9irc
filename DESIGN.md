@@ -23,19 +23,40 @@ inside that service. No internal actor opens a separate listener.
     events    read: recent raw IRC lines, oldest first
     statuslog read: recent server replies and events, oldest first
     conversations read: key<TAB>display name, one conversation per line
+    knownusers read: nick<TAB>user<TAB>host<TAB>account<TAB>away, one per line
+    queue     read: number of outbound frames waiting for the pacer
     channels/<casefolded-target-hex>/
-      name, kind, topic, nicks, transcript, historypath, historystatus
+      name, kind, topic, topicsetter, nicks, modes, transcript,
+      historypath, historystatus
     users/<casefolded-target-hex>/
-      name, kind, topic, nicks, transcript, historypath, historystatus
+      name, kind, topic, topicsetter, nicks, modes, transcript,
+      user, host, account, away, historypath, historystatus
     channel   read: selected channel
-    topic, nicks, transcript, historypath, historystatus
+    topic, topicsetter, nicks, modes, transcript, historypath, historystatus
               legacy selected-channel aliases
     input     write: one command per write
 ```
 
-`input` accepts `join`, `msg`, `nick`, `say`, and `quit`. It also accepts
+`nicks` is rendered from the live member set, with membership prefixes
+attached (`@alice`, `+bob`, `@+carol`). JOIN, PART, QUIT, KICK, NICK, and
+channel MODE updates rewrite it without requiring a rejoin. `modes` contains
+the current channel mode letters, for example `+nt`. The internal member list
+keeps the prefix set separate from the nick so mode changes and nick renames
+do not rewrite the whole list. `topicsetter` records the last setter seen in
+`TOPIC` or `333`. System events are also written to `transcript` as
+`* alice joined` style lines; raw protocol lines remain in `events` and
+`statuslog`. `knownusers` is updated from every `nick!user@host` prefix,
+WHOIS replies, `AWAY`, `ACCOUNT`, and `CHGHOST`; existing query conversations
+also expose the matching `user`, `host`, `account`, and `away` files.
+
+`input` accepts `join`, `part`, `msg`, `notice`, `me`, `topic`, `mode`,
+`kick`, `whois`, `away`, `invite`, `nick`, `say`, and `quit`. It also accepts
 `profile<TAB>...` to save connection settings and `connect<TAB>...` to save
-them and dial the server. The profile is a private file in the user's history
+them and dial the server. User-visible commands are appended to an outbound
+queue drained by a token-bucket pacer (`o9ircratelimit` lines per second,
+default 2, and `o9ircrateburst`, default 5); `queue` shows the current depth.
+PONG and registration bypass the queue. The profile is a private file in the
+user's history
 directory. The GUI opens Connection setup on a disconnected service and writes
 these commands through the same 9P input file. A failed command
 returns a write error. The `events` file keeps at most 32 KiB and is a snapshot;
@@ -43,7 +64,10 @@ clients that poll slowly can miss old lines. The network actor saves the
 transcript for each conversation as a zlib snapshot under the user's history
 directory and reloads it from a private index when the service starts. Its
 limit applies to compressed bytes. Older complete lines are evicted when the
-limit is reached. The GUI reads the plain text `statuslog` and selected
+limit is reached. Outgoing message bodies are split into multiple frames at
+UTF-8 boundaries when they exceed the 512-byte IRC limit. The conversation
+count defaults to 256 and is read once from `o9ircmaxconversations`.
+The GUI reads the plain text `statuslog` and selected
 conversation view, and keeps separate scroll positions for each. Its selection
 is local to each GUI, while the IRC data and commands stay in 9P. Monotonic
 event IDs are a future addition for clients that need lossless polling.

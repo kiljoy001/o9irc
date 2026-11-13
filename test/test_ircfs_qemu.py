@@ -101,6 +101,14 @@ def main():
                     conn.sendall(b":vm.test 332 " + accepted_nick + b" #test :A topic from 9P\r\n")
                     conn.sendall(b":vm.test 353 " + accepted_nick + b" = #test :@alice bob " + accepted_nick + b"\r\n")
                     conn.sendall(b":vm.test 366 " + accepted_nick + b" #test :End of names\r\n")
+                    conn.sendall(b":carol!u@h JOIN #test\r\n")
+                    conn.sendall(b":bob!u@h PART #test :bye\r\n")
+                    conn.sendall(b":dave!u@h JOIN #test\r\n")
+                    conn.sendall(b":dave!u@h QUIT :gone\r\n")
+                    conn.sendall(b":vm.test KICK #test carol :bye\r\n")
+                    conn.sendall(b":vm.test MODE #test +o alice\r\n")
+                    conn.sendall(b":vm.test TOPIC #test :New topic\r\n")
+                    conn.sendall(b":vm.test NOTICE #test :server notice\r\n")
                     conn.sendall(b":alice!u@h PRIVMSG #test :view hello\r\n")
                     conn.sendall(b":alice!u@h PRIVMSG " + accepted_nick + b" :private hello\r\n")
                     welcome_sent.set()
@@ -113,6 +121,17 @@ def main():
                     assert get_line() == b"PRIVMSG #other :from view"
                     assert get_line() == b"PRIVMSG bob :reply"
                     assert get_line() == b"PRIVMSG #test :back to first"
+                    assert get_line() == b"WHOIS bob"
+                    conn.sendall(b":vm.test 311 testnick bob u h * :Bob Real\r\n")
+                    conn.sendall(b":vm.test 318 testnick bob :End of whois\r\n")
+                    assert get_line() == b"NOTICE bob :notice from view"
+                    assert get_line() == b"PRIVMSG #other :\x01ACTION waves\x01"
+                    assert get_line() == b"MODE #test +n"
+                    conn.sendall(b":vm.test MODE #test +n\r\n")
+                    assert get_line() == b"TOPIC #test :topic from view"
+                    assert get_line() == b"AWAY :lunch"
+                    assert get_line() == b"INVITE bob #other"
+                    assert get_line() == b"KICK #test bob :bye"
                     guest_message.set()
                     for batch in range(stress_batches):
                         for i in range(stress_count):
@@ -148,7 +167,7 @@ def main():
             subprocess.run(["cp", "--sparse=always", IMAGE, disk], check=True)
             fat = f"{disk}@@{builder.ninefat_offset(disk)}"
             subprocess.run(["mmd", "-i", fat, "::o9irc"], check=True)
-            sources = ("ircfs.o9", "protocol.o9", "history.o9", "gui.o9",
+            sources = ("ircfs.o9", "protocol.o9", "state.o9", "history.o9", "gui.o9",
                        "uiio.o9", "draw.o9", "ui_input_probe.o9", "profile_probe.o9",
                        "history_probe.o9")
             if spawn_probe:
@@ -222,7 +241,7 @@ def main():
                     if spawn_probe or string_probe:
                         stem = "spawn_memory_probe" if spawn_probe else "string_memory_probe"
                         tag = "SPAWN" if spawn_probe else "STRING"
-                        result = guest(f"o9build /tmp/{stem}.o9", 120)
+                        result = guest(f"o9build /tmp/{stem}.o9", 30)
                         if f"built /tmp/{stem}" not in result:
                             raise RuntimeError(f"{tag} probe build failed:\n" + result)
                         guest(f"/tmp/{stem} probe >/tmp/memory-probe.log >[2=1] &", 30)
@@ -245,23 +264,23 @@ def main():
                             raise RuntimeError(f"{tag.lower()} probe memory grew: {probe_sizes!r} KiB")
                         complete = True
                         return
-                    build = guest("o9build /tmp/ircfs.o9", 120)
+                    build = guest("o9build /tmp/ircfs.o9", 30)
                     if "built /tmp/ircfs" not in build:
                         raise RuntimeError("o9build failed:\n" + build)
-                    gui_build = guest("o9build /tmp/gui.o9", 120)
+                    gui_build = guest("o9build /tmp/gui.o9", 30)
                     if "built /tmp/gui" not in gui_build:
                         raise RuntimeError("GUI build failed:\n" + gui_build)
-                    probe_build = guest("o9build /tmp/ui_input_probe.o9", 120)
+                    probe_build = guest("o9build /tmp/ui_input_probe.o9", 30)
                     if "built /tmp/ui_input_probe" not in probe_build:
                         raise RuntimeError("GUI input probe build failed:\n" + probe_build)
                     if setup_mode:
-                        profile_build = guest("o9build /tmp/profile_probe.o9", 120)
+                        profile_build = guest("o9build /tmp/profile_probe.o9", 30)
                         if "built /tmp/profile_probe" not in profile_build:
                             raise RuntimeError("profile probe build failed:\n" + profile_build)
-                    history_build = guest("o9build /tmp/history_probe.o9", 120)
+                    history_build = guest("o9build /tmp/history_probe.o9", 30)
                     if "built /tmp/history_probe" not in history_build:
                         raise RuntimeError("history probe build failed:\n" + history_build)
-                    history_probe = guest("/tmp/history_probe history-probe", 120)
+                    history_probe = guest("/tmp/history_probe history-probe", 30)
                     if ("HISTORY_LIMIT_OK" not in history_probe or
                             "HISTORY_RAW_LIMIT_OK" not in history_probe or
                             "_FAIL" in history_probe):
@@ -320,7 +339,10 @@ def main():
                     if not welcome_sent.wait(10):
                         runtime = guest("cat /tmp/ircfs.log", 30)
                         view_status = guest("cat /mnt/o9irc/view/networks/default/status", 30)
-                        raise RuntimeError(f"server handshake failed: accepted={accepted.is_set()} {failure or received}; runtime: {runtime}; view: {view_status}")
+                        view_queue = guest("cat /mnt/o9irc/view/networks/default/queue", 30)
+                        view_log = guest("cat /mnt/o9irc/view/networks/default/statuslog", 30)
+                        view_index = guest("cat /mnt/o9irc/view/networks/default/conversations", 30)
+                        raise RuntimeError(f"server handshake failed: accepted={accepted.is_set()} {failure or received}; runtime: {runtime}; view: {view_status}; queue: {view_queue}; index: {view_index}; log: {view_log}")
                     deadline = time.monotonic() + 10
                     status = ""
                     while time.monotonic() < deadline:
@@ -333,8 +355,10 @@ def main():
                         time.sleep(0.1)
                     if "connected" not in status:
                         runtime = guest("cat /tmp/ircfs.log", 30)
+                        view_log = guest("cat /mnt/o9irc/view/networks/default/statuslog", 30)
+                        view_events = guest("cat /mnt/o9irc/view/networks/default/events", 30)
                         root_listing = guest("ls /mnt/o9irc", 30)
-                        raise RuntimeError(f"9P status view missing:\n{status}\nruntime:\n{runtime}\nroot:\n{root_listing}")
+                        raise RuntimeError(f"9P status view missing:\n{status}\nruntime:\n{runtime}\nlog:\n{view_log}\nevents:\n{view_events}\nreceived:\n{received!r}\nfailure:\n{failure!r}\nroot:\n{root_listing}")
                     deadline = time.monotonic() + 10
                     events = ""
                     while time.monotonic() < deadline:
@@ -346,12 +370,23 @@ def main():
                         raise RuntimeError("9P events view missing:\n" + events)
                     topic = guest("cat /mnt/o9irc/view/networks/default/topic", 30)
                     nicks = guest("cat /mnt/o9irc/view/networks/default/nicks", 30)
+                    modes = guest("cat /mnt/o9irc/view/networks/default/modes", 30)
                     transcript = guest("cat /mnt/o9irc/view/networks/default/transcript", 30)
                     statuslog = guest("cat /mnt/o9irc/view/networks/default/statuslog", 30)
-                    if "A topic from 9P" not in topic or "@alice" not in nicks or "bob" not in nicks:
+                    if "New topic" not in topic or "@alice" not in nicks or accepted_nick.decode() not in nicks:
                         raise RuntimeError(f"9P topic/nicks missing: {topic!r} {nicks!r}")
+                    if "bob" in nicks or "carol" in nicks or "dave" in nicks:
+                        raise RuntimeError(f"part/quit/kick left stale nicks: {nicks!r}")
+                    if "+o" not in modes:
+                        raise RuntimeError(f"9P channel modes missing: {modes!r}")
                     if "<alice> view hello" not in transcript:
                         raise RuntimeError("9P transcript missing:\n" + transcript)
+                    for event in ("* carol joined", "* bob left (bye)",
+                                  "* dave quit (gone)", "* vm.test kicked carol (bye)",
+                                  "* vm.test changed the topic: New topic",
+                                  "-vm.test- server notice"):
+                        if event not in transcript:
+                            raise RuntimeError(f"system event missing from transcript: {event!r}\n{transcript}")
                     if f"332 {accepted_nick.decode()} #test" not in statuslog or "view hello" in statuslog:
                         raise RuntimeError("9P status stream is not separated from chat:\n" + statuslog)
                     if nick_conflict and "nickname in use; trying testnick_" not in statuslog:
@@ -368,6 +403,16 @@ def main():
                     private = guest(f"cat /mnt/o9irc/view/networks/default/{alice}/transcript", 30)
                     if "<alice> private hello" not in private:
                         raise RuntimeError(f"private conversation missing: {private!r}")
+                    known = guest("cat /mnt/o9irc/view/networks/default/knownusers", 30)
+                    if "alice\tu\th" not in known or "carol\tu\th" not in known:
+                        raise RuntimeError(f"known-user table missing identities: {known!r}")
+                    user_field = guest(f"cat /mnt/o9irc/view/networks/default/{alice}/user", 30)
+                    host_field = guest(f"cat /mnt/o9irc/view/networks/default/{alice}/host", 30)
+                    if "u" not in user_field or "h" not in host_field:
+                        raise RuntimeError(f"per-user identity files missing: {user_field!r} {host_field!r}")
+                    queue_depth = guest("cat /mnt/o9irc/view/networks/default/queue", 30)
+                    if queue_depth.strip() not in ("0", "0\r"):
+                        raise RuntimeError(f"outbound queue did not drain: {queue_depth!r}")
                     history_status = guest("cat /mnt/o9irc/view/networks/default/historystatus", 30)
                     history_path = guest("cat /mnt/o9irc/view/networks/default/historypath", 30)
                     if not history_disabled and ("saved" not in history_status or ".o9h" not in history_path):
@@ -402,12 +447,29 @@ def main():
                             path = guest(f"cat /mnt/o9irc/view/networks/default/{conversation}/historypath", 30)
                             if "saved" not in saved or ".o9h" not in path:
                                 raise RuntimeError(f"compressed history missing for {conversation}: {saved!r} {path!r}")
-                    for command in ("say from view", "msg bob reply", "msg #test back to first"):
+                    for command in ("say from view", "msg bob reply",
+                                    "msg #test back to first", "whois bob",
+                                    "notice bob notice from view", "me waves",
+                                    "mode #test +n", "topic #test topic from view",
+                                    "away lunch", "invite bob #other",
+                                    "kick #test bob :bye"):
                         write = guest(f"/tmp/ui_input_probe probe /mnt/o9irc/view/networks/default/input '{command}'", 30)
                         if "o9irc-ui-write:" not in write:
                             raise RuntimeError(f"GUI command write failed: {write!r}")
-                    if not guest_message.wait(10):
+                    if not guest_message.wait(20):
                         raise RuntimeError(f"9P command not sent: {failure or received}")
+                    deadline = time.monotonic() + 10
+                    bob_text = ""
+                    while time.monotonic() < deadline:
+                        bob_text = guest(f"cat /mnt/o9irc/view/networks/default/{bob}/transcript", 30)
+                        if "notice from view" in bob_text and "Bob Real" in bob_text:
+                            break
+                        time.sleep(0.1)
+                    if "notice from view" not in bob_text or "Bob Real" not in bob_text:
+                        raise RuntimeError(f"notice/whois did not reach the query transcript: {bob_text!r}")
+                    modes = guest(f"cat /mnt/o9irc/view/networks/default/{first}/modes", 30)
+                    if "+on" not in modes and "+no" not in modes:
+                        raise RuntimeError(f"outgoing MODE did not update channel modes: {modes!r}")
                     if stress_count:
                         previous_size = None
                         for batch in range(stress_batches):
