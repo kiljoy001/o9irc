@@ -1059,3 +1059,32 @@ function IrcSleepRaw(int64 ms) int64 {
     }
     return out;
 }
+
+// Reconnect attempt cap: 0 means unlimited (default). Values 1..1000 cap the
+// number of consecutive failures before the service stays disconnected.
+function IrcAttemptLimitRaw(string value) int64 {
+    int64 out;
+    c {
+        char *s, *end;
+        vlong n;
+
+        out = 0;
+        s = o9_string_cstr(value);
+        if(s != nil && s[0] != 0){
+            n = strtoll(s, &end, 10);
+            if(*end == 0 && n >= 0 && n <= 1000)
+                out = n;
+        }
+        free(s);
+    }
+    return out;
+}
+
+// Double a reconnect delay, clamped to one minute.
+function IrcBackoffNextRaw(int64 current) int64 {
+    int64 next;
+    next = current * 2;
+    if(next < 1) { next = 1; }
+    if(next > 60) { next = 60; }
+    return next;
+}

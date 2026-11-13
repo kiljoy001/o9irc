@@ -9,16 +9,29 @@ The current vertical slice has two actors:
 
 - `IrcNetwork` owns the IRC connection state and a `FileTree` registered as
   `o9irc.network.default`. It handles incoming lines and command requests.
+- `IrcSupervise` owns dial, registration, the read loop, the ping watchdog,
+  and teardown. It never exits while the service runs; `connect`,
+  `disconnect`, and `reconnect` are flags it observes between attempts.
 - `IrcViews` is the `ViewController`. It mounts the network tree into the
   application view and handles writes to the live input file.
 
 The app posts one `/srv/ircfs` 9P service. The actors compose their trees
 inside that service. No internal actor opens a separate listener.
 
+A failed dial or a dropped socket moves the service to `reconnecting` and
+schedules a new attempt with exponential backoff from one second to one
+minute plus jitter. `o9ircmaxattempts` caps consecutive failures; zero means
+unlimited. Reaching `001` clears the attempt count and rejoins channels whose
+`joined` flag is still set. A watchdog sends `PING` after 60 seconds of
+silence and closes the socket after 120 seconds without any server line. The
+supervisor owns exactly one socket at a time and closes it before a redial.
+
 ```text
 /srv/ircfs
   /view/networks/default/
-    status    read: disconnected | connecting | connected | closed
+    status    read: disconnected | connecting | connected | reconnecting | closed
+    lasterror read: the most recent connection failure
+    nextattempt read: Unix time of the next dial, or 0
     profile   read: host<TAB>port<TAB>nick<TAB>channel<TAB>full name
     events    read: recent raw IRC lines, oldest first
     statuslog read: recent server replies and events, oldest first

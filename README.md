@@ -91,7 +91,8 @@ The view also accepts `join #channel`, `part [#channel] [reason]`,
 `msg target text`, `notice target text`, `me action`,
 `topic [#channel] [text]`, `mode target modes`,
 `kick #channel nick [reason]`, `whois nick`, `away [message]`,
-`invite nick [#channel]`, `nick newname`, and `quit` in `input`.
+`invite nick [#channel]`, `nick newname`, `connect`, `disconnect`,
+`reconnect`, and `quit` in `input`.
 `profile<TAB>host<TAB>port<TAB>nick<TAB>channel<TAB>full name<TAB>tls<TAB>/absolute/path/to/trustedkeys`
 saves a TLS profile; use `tcp` and an empty final field for plain TCP.
 `connect<TAB>...` saves it and starts the connection. Existing five-field
@@ -140,7 +141,17 @@ conversations defaults to 256 and can be set with
 The outbound pacer sends two lines per second with a burst of five by default;
 `o9ircratelimit` (1 through 20) and `o9ircrateburst` (1 through 50) override
 that. `queue` shows how many frames are waiting. The top-level `knownusers`
-file lists every nick seen with its user, host, account, and away state. See
+file lists every nick seen with its user, host, account, and away state.
+
+The service reconnects on its own. `status` moves through `disconnected`,
+`connecting`, `connected`, `reconnecting`, and `closed`; `lasterror` shows the
+last failure and `nextattempt` is the Unix time of the next dial. Backoff
+starts at one second, doubles to one minute, and includes a little jitter.
+`o9ircmaxattempts` caps consecutive failures (`0`, the default, means retry
+forever). A successful `001` resets the backoff and rejoins channels that are
+still marked joined. The service sends `PING` after 60 seconds of silence and
+treats 120 seconds without any server line as a dead link. Write `connect`,
+`disconnect`, or `reconnect` to `input` to control the supervisor by hand. See
 [DESIGN.md](DESIGN.md) for the view layout and next steps.
 
 Next steps: reconnect supervision, stable event cursors, and native TLS.

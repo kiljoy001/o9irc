@@ -112,11 +112,12 @@ function IrcTrailingRaw(string payload) string {
 
 // The network pump has one reader. Keep incomplete frames in one bounded
 // buffer so receiving a line does not create an actor for every slice.
-function IrcReadLineRaw(string token) string {
+function IrcReadLineRaw(string token, int64 generation) string {
     string out;
     c {
         static char pending[8192];
         static int used, previous = -1;
+        static vlong previousGen = -1;
         char *end, *name;
         int fd, n, size;
 
@@ -125,6 +126,11 @@ function IrcReadLineRaw(string token) string {
         if(name != nil){
             fd = atoi(name);
             free(name);
+            if(generation != previousGen){
+                used = 0;
+                previous = -1;
+                previousGen = generation;
+            }
             if(fd != previous){
                 used = 0;
                 previous = fd;
@@ -304,7 +310,18 @@ class IrcNetwork {
     private string registrationBase;
     private int64 nickFallbacks;
     private bool registered;
-    private bool dialing;
+    private bool wantConnected;
+    private bool linkUp;
+    private bool shuttingDown;
+    private bool supervisorStarted;
+    private int64 generation;
+    private int64 attempt;
+    private int64 maxAttempts;
+    private int64 backoffSec;
+    private int64 nextAttemptSec;
+    private int64 lastIncomingSec;
+    private int64 lastPingSec;
+    private string lastError;
     private string events;
     private string statuslog;
     private string address;
@@ -344,8 +361,9 @@ class IrcNetwork {
     method IrcNetwork(string firstChannel, string initialNick, string server,
                       string directory, int64 maximum) {
         files = new FileTree();
-        files.text("status", "connecting\n", false);
-        if(len(server) == 0) { files.text("status", "disconnected\n", false); }
+        files.text("status", "disconnected\n", false);
+        files.text("lasterror", "", false);
+        files.text("nextattempt", "0\n", false);
         files.text("events", "", false);
         files.text("statuslog", "", false);
         files.text("conversations", "", false);
@@ -380,7 +398,18 @@ class IrcNetwork {
         registrationBase = cat(initialNick, "");
         nickFallbacks = 0;
         registered = false;
-        dialing = len(server) > 0;
+        wantConnected = len(server) > 0;
+        linkUp = false;
+        shuttingDown = false;
+        supervisorStarted = false;
+        generation = 0;
+        attempt = 0;
+        maxAttempts = 0;
+        backoffSec = 1;
+        nextAttemptSec = 0;
+        lastIncomingSec = 0;
+        lastPingSec = 0;
+        lastError = "";
         events = "";
         statuslog = "";
         address = server;
@@ -409,9 +438,12 @@ class IrcNetwork {
             getenv("o9ircratelimit"), 2, 20);
         Task<int64> configuredBurst = spawn IrcRateValueRaw(
             getenv("o9ircrateburst"), 5, 50);
+        Task<int64> configuredAttempts = spawn IrcAttemptLimitRaw(
+            getenv("o9ircmaxattempts"));
         conversationLimit = configuredLimit.take();
         rateLines = configuredRate.take();
         rateBurst = configuredBurst.take();
+        maxAttempts = configuredAttempts.take();
         if(historyLimit > 0) {
             Task<int64> directoryReady = spawn FileMkdirAllRaw(historyDirectory);
             if(directoryReady.take() != 0) {
@@ -1159,33 +1191,234 @@ class IrcNetwork {
         return encoded.take();
     }
 
-    internal method void connected(string token) {
-        fd = token;
-        dialing = false;
-        files.text("status", "connected\n", false);
+    internal method void writeStatus(string value) {
+        files.text("status", cat(value, "\n"), false);
     }
 
-    internal method void closed() {
+    internal method void writeLastError(string value) {
+        lastError.dispose();
+        lastError = cat(value, "");
+        files.text("lasterror", cat(value, "\n"), false);
+    }
+
+    internal method void publishNextAttempt(int64 seconds) {
+        Task<string> text = spawn IrcIntTextRaw(seconds);
+        string value = text.take();
+        files.text("nextattempt", cat(value, "\n"), false);
+        value.dispose();
+    }
+
+    internal method int64 nowSeconds() {
+        Task<int64> now = spawn TimeNowRaw();
+        return now.take();
+    }
+
+    internal method void closeSocket() {
         if(len(fd) > 0) {
             Task<int64> stopped = spawn NetCloseRaw(fd);
             stopped.take();
+            fd.dispose();
+            fd = "";
         }
-        fd = "";
-        dialing = false;
+        linkUp = false;
         outbound.dispose();
         outbound = "";
         outboundDepth = 0;
         files.text("queue", "0\n", false);
-        files.text("status", "closed\n", false);
     }
 
-    internal method string connectionAddress() { return address; }
-    internal method string connectionNick() { return nick; }
-    internal method string connectionName() { return realName; }
-    internal method string connectionTransport() { return transport; }
-    internal method string connectionTrustPath() { return trustPath; }
-    internal method string connectionHost() { return serverHost; }
-    internal method void connectionError(string message) { appendStatus(message); }
+    internal method int64 connected(string token) {
+        if(len(fd) > 0) { closeSocket(); }
+        fd = token;
+        linkUp = true;
+        generation = generation + 1;
+        registered = false;
+        nickFallbacks = 0;
+        lastIncomingSec = nowSeconds();
+        lastPingSec = 0;
+        writeStatus("connecting");
+        return generation;
+    }
+
+    internal method void markRegistered() {
+        registered = true;
+        attempt = 0;
+        backoffSec = 1;
+        nextAttemptSec = 0;
+        publishNextAttempt(0);
+        writeLastError("");
+        writeStatus("connected");
+    }
+
+    internal method void scheduleReconnect(string message) {
+        closeSocket();
+        generation = generation + 1;
+        registered = false;
+        writeLastError(message);
+        if(maxAttempts > 0 && attempt >= maxAttempts) {
+            wantConnected = false;
+            writeStatus("disconnected");
+            publishNextAttempt(0);
+            writeLastError("reconnect attempts exhausted");
+        } else {
+            attempt = attempt + 1;
+            int64 delay = backoffSec;
+            Task<int64> nextBackoff = spawn IrcBackoffNextRaw(backoffSec);
+            backoffSec = nextBackoff.take();
+            int64 now = nowSeconds();
+            nextAttemptSec = now + delay + (now % 3);
+            publishNextAttempt(nextAttemptSec);
+            writeStatus("reconnecting");
+        }
+    }
+
+    internal method void linkLost(int64 gen, string message) {
+        if(gen == generation) {
+            closeSocket();
+            if(shuttingDown) {
+                writeStatus("closed");
+                publishNextAttempt(0);
+            } else if(!wantConnected) {
+                writeStatus("disconnected");
+                publishNextAttempt(0);
+            } else {
+                scheduleReconnect(message);
+            }
+        }
+    }
+
+    internal method void connectionFailed(string message) {
+        closeSocket();
+        if(shuttingDown) {
+            writeStatus("closed");
+            publishNextAttempt(0);
+        } else if(!wantConnected) {
+            writeStatus("disconnected");
+            publishNextAttempt(0);
+        } else {
+            scheduleReconnect(message);
+        }
+    }
+
+    internal method bool wantsConnection() { return wantConnected && !shuttingDown; }
+    internal method bool retryDue() {
+        if(!wantConnected || shuttingDown || linkUp) { return false; }
+        return nowSeconds() >= nextAttemptSec;
+    }
+
+    internal method void beginConnect() {
+        writeStatus("connecting");
+        nextAttemptSec = 0;
+        publishNextAttempt(0);
+        writeLastError("");
+    }
+
+    internal method void requestConnect() {
+        shuttingDown = false;
+        if(len(address) == 0) {
+            wantConnected = false;
+            writeLastError("no server configured");
+            writeStatus("disconnected");
+        } else {
+            if(!wantConnected) {
+                attempt = 0;
+                backoffSec = 1;
+            }
+            wantConnected = true;
+            if(!linkUp) { writeStatus("connecting"); }
+        }
+    }
+
+    internal method void requestDisconnect() {
+        wantConnected = false;
+        shuttingDown = false;
+        attempt = 0;
+        backoffSec = 1;
+        nextAttemptSec = 0;
+        publishNextAttempt(0);
+        generation = generation + 1;
+        closeSocket();
+        writeStatus("disconnected");
+    }
+
+    internal method void requestReconnect() {
+        shuttingDown = false;
+        if(len(address) == 0) {
+            wantConnected = false;
+            writeLastError("no server configured");
+            writeStatus("disconnected");
+        } else {
+            wantConnected = true;
+            attempt = 0;
+            backoffSec = 1;
+            nextAttemptSec = 0;
+            publishNextAttempt(0);
+            generation = generation + 1;
+            closeSocket();
+            writeStatus("reconnecting");
+        }
+    }
+
+    internal method void shutDownService() {
+        shuttingDown = true;
+        wantConnected = false;
+        generation = generation + 1;
+        closeSocket();
+        writeStatus("closed");
+        publishNextAttempt(0);
+    }
+
+    internal method bool claimSupervisor() {
+        if(supervisorStarted) { return false; }
+        supervisorStarted = true;
+        return true;
+    }
+
+    internal method void applyTransport(string nextTransport, string host,
+                                        string trust) {
+        transport.dispose();
+        serverHost.dispose();
+        trustPath.dispose();
+        transport = cat(nextTransport, "");
+        serverHost = cat(host, "");
+        trustPath = cat(trust, "");
+    }
+
+    internal method void markIncoming() {
+        lastIncomingSec = nowSeconds();
+        lastPingSec = 0;
+    }
+
+    internal method int64 watchdogTick(int64 gen) {
+        int64 result = 1;
+        if(gen != generation || !linkUp) {
+            result = 0;
+        } else {
+            int64 now = nowSeconds();
+            if(now - lastIncomingSec >= 120) {
+                scheduleReconnect("ping timeout");
+                result = 0;
+            } else if(now - lastIncomingSec >= 60 &&
+                      (lastPingSec == 0 || now - lastPingSec >= 60)) {
+                Task<bool> sent = spawn IrcSend(fd, "PING :o9irc");
+                sent.take();
+                lastPingSec = now;
+            }
+        }
+        return result;
+    }
+
+    internal method void closed() {
+        shutDownService();
+    }
+
+    internal method string connectionAddress() { return cat(address, ""); }
+    internal method string connectionNick() { return cat(nick, ""); }
+    internal method string connectionName() { return cat(realName, ""); }
+    internal method string connectionTransport() { return cat(transport, ""); }
+    internal method string connectionTrustPath() { return cat(trustPath, ""); }
+    internal method string connectionHost() { return cat(serverHost, ""); }
+    internal method void connectionError(string message) { connectionFailed(message); }
 
     internal method bool configure(string value, bool connectNow) {
         Task<bool> valid = spawn IrcProfileValidRaw(value);
@@ -1193,7 +1426,7 @@ class IrcNetwork {
             appendStatus("o9irc: invalid connection settings");
             return false;
         }
-        if(connectNow && (len(fd) > 0 || dialing)) {
+        if(connectNow && (linkUp || wantConnected)) {
             appendStatus("o9irc: disconnect before connecting to another server");
             return false;
         }
@@ -1250,8 +1483,13 @@ class IrcNetwork {
         }
         registered = false;
         nickFallbacks = 0;
-        dialing = true;
-        files.text("status", "connecting\n", false);
+        shuttingDown = false;
+        wantConnected = true;
+        attempt = 0;
+        backoffSec = 1;
+        nextAttemptSec = 0;
+        publishNextAttempt(0);
+        writeStatus("connecting");
         if(len(nextChannel) > 0) {
             Task<bool> validChannel = spawn IrcValidTargetRaw(nextChannel);
             Task<bool> isChannel = spawn IrcIsChannelRaw(nextChannel);
@@ -1299,7 +1537,7 @@ class IrcNetwork {
             token.dispose();
         }
         if(cmp(commandName, "001") == 0 && len(fd) > 0) {
-            registered = true;
+            markRegistered();
             Task<string> assignedField = spawn StringFieldRaw(payload, " ", 1);
             string assigned = assignedField.take();
             if(len(assigned) > 0) {
@@ -1843,6 +2081,18 @@ class IrcNetwork {
             value.dispose();
             return ok;
         }
+        if(cmp(input, "connect") == 0) {
+            requestConnect();
+            return true;
+        }
+        if(cmp(input, "disconnect") == 0) {
+            requestDisconnect();
+            return true;
+        }
+        if(cmp(input, "reconnect") == 0) {
+            requestReconnect();
+            return true;
+        }
         if(len(fd) == 0 || len(input) == 0) { return false; }
         Task<int64> join = spawn StringStartsWithRaw(input, "join ");
         Task<int64> isMessage = spawn StringStartsWithRaw(input, "msg ");
@@ -2278,63 +2528,106 @@ class IrcNetwork {
             return ok;
         }
         if(cmp(input, "quit") == 0) {
-            return enqueueLine("QUIT :leaving");
+            bool ok = enqueueLine("QUIT :leaving");
+            shutDownService();
+            return ok;
         }
         return false;
     }
 }
 
-function IrcPump(string fd) int64 {
+function IrcWatchdog(int64 gen) int64 {
     IrcNetwork network = lookup("network");
     while(true) {
-        Task<string> read = spawn IrcReadLineRaw(fd);
+        Task<int64> slept = spawn IrcSleepRaw(5000);
+        slept.take();
+        int64 keep = network.watchdogTick(gen);
+        if(keep == 0) { return 0; }
+    }
+}
+
+function IrcPump(string fd, int64 gen) int64 {
+    IrcNetwork network = lookup("network");
+    while(true) {
+        Task<string> read = spawn IrcReadLineRaw(fd, gen);
         string line = read.take();
         if(len(line) == 0) {
             line.dispose();
-            network.closed();
+            network.linkLost(gen, "connection closed");
             return 0;
         }
+        network.markIncoming();
         network.incoming(line);
         line.dispose();
     }
 }
 
-function IrcStart(string address, string nick, string realName,
-                  string transport, string host, string trustPath) int64 {
+// One supervisor owns dial, registration, the read loop, the ping watchdog,
+// and teardown. It never exits while the service runs; connect, disconnect,
+// and reconnect are requests handled between attempts.
+function IrcSupervise() int64 {
     IrcNetwork network = lookup("network");
-    Task<string> dial;
-    if(cmp(transport, "tls") == 0) {
-        dial = spawn IrcDialTLSRaw(address, host, trustPath);
-    } else {
-        dial = spawn NetDialRaw(address);
+    while(true) {
+        if(!network.wantsConnection()) {
+            Task<int64> idle = spawn IrcSleepRaw(500);
+            idle.take();
+        } else if(!network.retryDue()) {
+            Task<int64> wait = spawn IrcSleepRaw(250);
+            wait.take();
+        } else {
+            network.beginConnect();
+            string address = network.connectionAddress();
+            string transport = network.connectionTransport();
+            string host = network.connectionHost();
+            string trust = network.connectionTrustPath();
+            string nick = network.connectionNick();
+            string realName = network.connectionName();
+            Task<string> dial;
+            if(cmp(transport, "tls") == 0) {
+                dial = spawn IrcDialTLSRaw(address, host, trust);
+            } else {
+                dial = spawn NetDialRaw(address);
+            }
+            string fd = dial.take();
+            Task<int64> failed = spawn StringStartsWithRaw(fd, "error:");
+            if(failed.take() != 0) {
+                Task<string> detail = spawn StringSliceRaw(fd, 6, len(fd) - 6);
+                string message = detail.take();
+                network.connectionFailed(message);
+                message.dispose();
+                fd.dispose();
+            } else if(len(fd) == 0) {
+                network.connectionFailed("dial returned no descriptor");
+            } else {
+                int64 gen = network.connected(fd);
+                Task<bool> registrationNick = spawn IrcSend(fd, cat("NICK ", nick));
+                bool nickSent = registrationNick.take();
+                string shownName = realName;
+                if(len(shownName) == 0) { shownName = nick; }
+                bool userSent = false;
+                if(nickSent) {
+                    Task<bool> registrationUser = spawn IrcSend(fd,
+                        cat(cat(cat("USER ", nick), " 0 * :"), shownName));
+                    userSent = registrationUser.take();
+                }
+                if(!nickSent || !userSent) {
+                    network.linkLost(gen, "registration write failed");
+                } else {
+                    Task<int64> watchdog = spawn IrcWatchdog(gen);
+                    Task<int64> reader = spawn IrcPump(fd, gen);
+                    reader.take();
+                    watchdog.take();
+                }
+                fd.dispose();
+            }
+            address.dispose();
+            transport.dispose();
+            host.dispose();
+            trust.dispose();
+            nick.dispose();
+            realName.dispose();
+        }
     }
-    string fd = dial.take();
-    Task<int64> failed = spawn StringStartsWithRaw(fd, "error:");
-    if(failed.take() != 0) {
-        Task<string> detail = spawn StringSliceRaw(fd, 6, len(fd)-6);
-        network.connectionError(detail.take());
-        network.closed();
-        return -1;
-    }
-    if(len(fd) == 0) {
-        network.closed();
-        return -1;
-    }
-    network.connected(fd);
-    Task<bool> registrationNick = spawn IrcSend(fd, cat("NICK ", nick));
-    if(!registrationNick.take()) {
-        network.closed();
-        return -1;
-    }
-    string shownName = realName;
-    if(len(shownName) == 0) { shownName = nick; }
-    Task<bool> registrationUser = spawn IrcSend(fd, cat(cat(cat("USER ", nick), " 0 * :"), shownName));
-    if(!registrationUser.take()) {
-        network.closed();
-        return -1;
-    }
-    Task<int64> reader = spawn IrcPump(fd);
-    return 0;
 }
 
 class IrcViews {
@@ -2373,15 +2666,7 @@ class IrcViews {
             input = trimmed.take();
             ownsInput = true;
         }
-        Task<int64> connects = spawn StringStartsWithRaw(input, "connect\t");
-        bool connectNow = connects.take() != 0;
         bool accepted = network.command(input);
-        if(accepted && connectNow) {
-            Task<int64> connection = spawn IrcStart(network.connectionAddress(),
-                network.connectionNick(), network.connectionName(),
-                network.connectionTransport(), network.connectionHost(),
-                network.connectionTrustPath());
-        }
         if(ownsInput) { input.dispose(); }
         if(accepted) {
             return len(text);
@@ -2440,11 +2725,12 @@ main {
         }
         Task<int64> limit = spawn IrcHistoryLimitRaw(limitArg);
         IrcNetwork network = new IrcNetwork(channel, nick, address, historyDirectory, limit.take());
+        network.applyTransport(transport, serverName, trustFile);
+        if(len(address) > 0) { network.requestConnect(); }
         IrcViews views = new IrcViews(network);
         viewController(views);
-        if(len(address) > 0) {
-            Task<int64> connection = spawn IrcStart(address, nick, "",
-                transport, serverName, trustFile);
+        if(network.claimSupervisor()) {
+            Task<int64> supervisor = spawn IrcSupervise();
         }
         serve();
     }

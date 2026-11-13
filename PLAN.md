@@ -68,6 +68,14 @@ pacer enforces `o9ircratelimit`/`o9ircrateburst` without blocking command
 writes. Host tests cover the helpers and the QEMU fake server exercises the
 state transitions and commands.
 
+Phase 2 is implemented: `IrcSupervise` owns dial, registration, the read loop,
+the watchdog, and teardown; `status`/`lasterror`/`nextattempt` expose the
+lifecycle; backoff runs from one second to one minute with jitter and an
+optional attempt cap (`o9ircmaxattempts`); `connect`, `disconnect`, and
+`reconnect` control it. Reaching `001` resets backoff and rejoins the live
+channel set. The watchdog pings after 60 seconds of silence and drops a link
+after 120 seconds without data.
+
 ---
 
 ## Phase 1 - Protocol state and command surface (P0)

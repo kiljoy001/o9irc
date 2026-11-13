@@ -182,6 +182,20 @@ main {
     print("rate2=", rv2.take(), "\n");
     Task<string> it = spawn IrcIntTextRaw(42);
     print("inttext=<", it.take(), ">\n");
+    Task<int64> al0 = spawn IrcAttemptLimitRaw("");
+    print("attemptlimit0=", al0.take(), "\n");
+    Task<int64> al1 = spawn IrcAttemptLimitRaw("5");
+    print("attemptlimit1=", al1.take(), "\n");
+    Task<int64> al2 = spawn IrcAttemptLimitRaw("9999");
+    print("attemptlimit2=", al2.take(), "\n");
+    Task<int64> bo0 = spawn IrcBackoffNextRaw(0);
+    print("backoff0=", bo0.take(), "\n");
+    Task<int64> bo1 = spawn IrcBackoffNextRaw(1);
+    print("backoff1=", bo1.take(), "\n");
+    Task<int64> bo2 = spawn IrcBackoffNextRaw(40);
+    print("backoff2=", bo2.take(), "\n");
+    Task<int64> bo3 = spawn IrcBackoffNextRaw(60);
+    print("backoff3=", bo3.take(), "\n");
 
     // History limit parsing, drop policy, and a zlib roundtrip.
     Task<int64> hl0 = spawn IrcHistoryLimitRaw("0");
